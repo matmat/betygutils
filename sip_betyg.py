@@ -409,53 +409,107 @@ def collect_pdf_pages_and_metadata(rows_for_key, input_dir, headers, args):
     return pdf_pages, template_data, pdf_metadata
 
 
+from contextlib import contextmanager
+
+@contextmanager
+def temporary_pdf_file():
+    """Context manager for temporary PDF files with guaranteed cleanup.
+
+    Yields a Path object pointing to a temporary file that will be cleaned up
+    automatically when the context exits, even if an exception occurs.
+
+    Example:
+        with temporary_pdf_file() as temp_path:
+            # Use temp_path for operations
+            combine_pdf_pages(pages, temp_path)
+            # File is automatically deleted when leaving this block
+
+    Yields:
+        Path: Path object pointing to the temporary file
+    """
+    temp_file = None
+    temp_path = None
+
+    try:
+        # Create temporary file
+        temp_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+        temp_path = Path(temp_file.name)
+        temp_file.close()  # Close immediately so other processes can use it
+
+        yield temp_path
+
+    finally:
+        # Ensure cleanup happens no matter what
+        if temp_file is not None:
+            try:
+                temp_file.close()  # Ensure file handle is closed
+            except:
+                pass  # File might already be closed
+
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except PermissionError:
+                # On Windows, file might still be in use
+                warnings.warn(f"Could not delete temporary file {temp_path}: File may still be in use")
+            except Exception as e:
+                warnings.warn(f"Could not delete temporary file {temp_path}: {e}")
+
+
 def create_pdf_output(pdf_pages, pdf_output_path, args, pdf2archive_cmd, pdf_metadata):
-    """Create PDF output with optional PDF/A conversion."""
+    """Create PDF output with optional PDF/A conversion.
+
+    Args:
+        pdf_pages: List of tuples (pdf_path, page_number) to combine
+        pdf_output_path: Path where the final PDF should be saved
+        args: Command line arguments object
+        pdf2archive_cmd: Path to pdf2archive command
+        pdf_metadata: Dictionary of metadata fields for PDF/A
+
+    Returns:
+        bool: True if PDF was created successfully, False otherwise
+    """
     if not pdf_pages:
         return False
 
     if args.pdfa:
-        # Use temporary file for intermediate PDF
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-            temp_path = Path(temp_file.name)
-
-        try:
+        # Use context manager for temporary file handling
+        with temporary_pdf_file() as temp_path:
             # First combine pages to temporary file
-            if combine_pdf_pages(pdf_pages, temp_path, 
-                               remove_metadata=not args.preserve_metadata, 
-                               verbose=args.verbose):
-                # Convert to PDF/A
-                clean_meta = not (args.pdfa_metadata or args.preserve_metadata)
-
-                if convert_to_pdfa_with_pdf2archive(
-                    temp_path, 
-                    pdf_output_path,
-                    pdf2archive_cmd=pdf2archive_cmd,
-                    metadata=pdf_metadata if args.pdfa_metadata else None,
-                    quality=args.pdfa_quality,
-                    clean_metadata=clean_meta,
-                    verbose=args.verbose
-                ):
-                    metadata_info = ""
-                    if args.pdfa_metadata:
-                        metadata_info = " (with metadata)"
-                    elif not args.preserve_metadata:
-                        metadata_info = " (metadata cleaned)"
-                    print(f"PDF/A-1B{metadata_info}: {pdf_output_path}")
-                    return True
-                else:
-                    # Fall back to regular PDF if conversion fails
-                    shutil.move(temp_path, pdf_output_path)
-                    warnings.warn(f"PDF/A conversion failed, created regular PDF: {pdf_output_path}")
-                    return True
-            else:
+            if not combine_pdf_pages(pdf_pages, temp_path, 
+                                   remove_metadata=not args.preserve_metadata, 
+                                   verbose=args.verbose):
                 warnings.warn(f"Failed to combine pages")
                 return False
 
-        finally:
-            # Clean up temporary file
-            if temp_path.exists():
-                temp_path.unlink()
+            # Convert to PDF/A
+            clean_meta = not (args.pdfa_metadata or args.preserve_metadata)
+
+            if convert_to_pdfa_with_pdf2archive(
+                temp_path, 
+                pdf_output_path,
+                pdf2archive_cmd=pdf2archive_cmd,
+                metadata=pdf_metadata if args.pdfa_metadata else None,
+                quality=args.pdfa_quality,
+                clean_metadata=clean_meta,
+                verbose=args.verbose
+            ):
+                metadata_info = ""
+                if args.pdfa_metadata:
+                    metadata_info = " (with metadata)"
+                elif not args.preserve_metadata:
+                    metadata_info = " (metadata cleaned)"
+                print(f"PDF/A-1B{metadata_info}: {pdf_output_path}")
+                return True
+            else:
+                # Fall back to regular PDF if conversion fails
+                try:
+                    shutil.copy2(temp_path, pdf_output_path)
+                    warnings.warn(f"PDF/A conversion failed, created regular PDF: {pdf_output_path}")
+                    return True
+                except Exception as e:
+                    warnings.warn(f"Failed to create fallback PDF: {e}")
+                    return False
 
     else:
         # Direct combination without PDF/A conversion
@@ -518,6 +572,33 @@ def process_key_group(key, rows_for_key, args, input_dir, output_dir, headers,
     # Generate template file
     template_path = key_dir / args.template_output
     generate_template_output(template, template_data, template_path, args.verbose)
+
+
+@contextmanager
+def open_csv_file(csv_file_path):
+    """Context manager for safely opening CSV files with support for stdin.
+
+    Args:
+        csv_file_path: Path to CSV file or '-' for stdin
+
+    Yields:
+        File object for reading CSV data
+
+    Raises:
+        IOError: If file cannot be opened
+    """
+    if csv_file_path == '-':
+        yield sys.stdin
+    else:
+        csv_file = None
+        try:
+            csv_file = open(csv_file_path, 'r', newline='', encoding='utf-8')
+            yield csv_file
+        except IOError as e:
+            raise IOError(f"Error opening CSV file: {e}")
+        finally:
+            if csv_file is not None:
+                csv_file.close()
 
 
 def main():
@@ -630,17 +711,8 @@ PDF/A-1B COMPLIANCE:
         # Get current date in ISO format for templates
         current_date = date.today().isoformat()
 
-        # Open CSV file
-        if args.csv_file == '-':
-            csv_file = sys.stdin
-        else:
-            try:
-                csv_file = open(args.csv_file, 'r', newline='', encoding='utf-8')
-            except IOError as e:
-                print(f"Error opening CSV file: {e}", file=sys.stderr)
-                sys.exit(1)
-
-        try:
+        # Use context manager for CSV file handling
+        with open_csv_file(args.csv_file) as csv_file:
             # Process CSV data
             headers, data_rows, has_header = process_csv_data(csv_file, args)
 
@@ -666,10 +738,6 @@ PDF/A-1B COMPLIANCE:
                     key, key_groups[key], args, input_dir, output_dir, 
                     headers, naming_field_indices, template, pdf2archive_cmd, current_date
                 )
-
-        finally:
-            if args.csv_file != '-':
-                csv_file.close()
 
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
