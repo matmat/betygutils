@@ -737,17 +737,166 @@ def select_closest_personnummer(results, page_num, last_captured_pnr, verbosity)
 
     return [selected_result]
 
-def find_all_personnummer_on_page(text, page_num, config, verbosity):
-    """Find all personnummer on a page with VALID DATES only."""
-    results = []
-    rejected_invalid_dates = []  # Track rejected ones for logging
-    pattern = config.personnummer_pattern
+
+def find_all_personnummer_on_page(text: str, page_num: int, config: Config, verbosity: int) -> List[Dict[str, Any]]:
+    """Find all personnummer on a page with VALID DATES only.
+
+    This function has been simplified by delegating regex and special extraction to helpers.
+    """
     lines = text.split('\n')
 
     if verbosity > 1:
         print(f"\n--- Page {page_num} ---", file=sys.stderr)
 
     # STEP 1: Try normal regex matching first
+    results, rejected_invalid_dates = _find_personnummer_with_regex(lines, config, verbosity)
+
+    # STEP 2: Only try special extraction if no valid-date personnummer found
+    if not results:
+        if verbosity > 1:
+            print(f"  No valid-date personnummer found with normal regex, trying special extraction...", file=sys.stderr)
+
+        special_results, special_rejected = _find_personnummer_with_special_extraction(lines, config, verbosity)
+        results.extend(special_results)
+        rejected_invalid_dates.extend(special_rejected)
+
+    # Summary logging
+    if verbosity > 1:
+        if rejected_invalid_dates:
+            print(f"  Page summary: {len(results) + len(rejected_invalid_dates)} personnummer found, "
+                  f"{len(rejected_invalid_dates)} rejected (invalid dates), {len(results)} valid for name extraction", 
+                  file=sys.stderr)
+        elif results:
+            print(f"  Page summary: {len(results)} valid-date personnummer found", file=sys.stderr)
+        else:
+            print(f"  Page summary: No valid-date personnummer found", file=sys.stderr)
+
+    return results
+
+
+def _extract_names_from_same_line(
+    line: str, 
+    pnr: str, 
+    config: Config, 
+    verbosity: int, 
+    match_info: Optional[Dict[str, Any]] = None
+) -> Tuple[str, str]:
+    """Extract names from the same line as personnummer.
+
+    Returns:
+        Tuple of (efternamn, fornamn) or ("", "") if not found
+    """
+    # Find personnummer position - use match info if available
+    pnr_pos = -1
+
+    if match_info and 'match_start' in match_info:
+        pnr_pos = match_info['match_start']
+        if verbosity > 1:
+            extraction_type = match_info.get('extraction_type', 'unknown')
+            print(f"    Using stored match position from {extraction_type} extraction: pos {pnr_pos}", file=sys.stderr)
+    else:
+        # Fallback to searching
+        pnr_pos = line.find(pnr)
+        if pnr_pos == -1:
+            # Try to find pattern match
+            match = re.search(pnr.replace('-', r'\-'), line)
+            if match:
+                pnr_pos = match.start()
+
+    # Extract prefix (everything before personnummer)
+    prefix = line[:pnr_pos].strip() if pnr_pos > 0 else ""
+
+    if prefix:
+        efternamn, fornamn = parse_name_from_text(prefix, config, verbosity)
+        if verbosity > 1 and efternamn:
+            format_type = "comma" if ',' in prefix else "space"
+            print(f"    Found name on same line ({format_type}): {efternamn}, {fornamn}", file=sys.stderr)
+        return efternamn, fornamn
+
+    return "", ""
+
+
+def _search_previous_lines_for_names(
+    lines: List[str], 
+    start_idx: int, 
+    config: Config, 
+    verbosity: int
+) -> Tuple[str, str]:
+    """Search previous lines for names.
+
+    Returns:
+        Tuple of (efternamn, fornamn) or ("", "") if not found
+    """
+    pattern = config.personnummer_pattern
+    found_lines = []
+    found_single_word = False
+
+    for prev_idx in range(start_idx - 1, -1, -1):
+        prev_line = lines[prev_idx].strip()
+        if not prev_line:
+            continue
+
+        # Skip filtered lines
+        if should_filter_line(prev_line, config):
+            if verbosity > 1:
+                print(f"    Filtered line: '{prev_line}'", file=sys.stderr)
+            continue
+
+        # Skip lines with personnummer
+        if re.search(pattern, prev_line) or extract_special_personnummer(prev_line, config):
+            continue
+
+        # Check for comma-separated format
+        if ',' in prev_line:
+            found_lines.append(prev_line)
+            break
+        else:
+            # Check word count for space-separated format
+            words = clean_name(prev_line, config).split()
+            if len(words) == 1 and words[0]:
+                found_lines.append(prev_line)
+                if found_single_word:
+                    break
+                found_single_word = True
+                continue
+            elif len(words) > 1:
+                found_lines.append(prev_line)
+                break
+
+    # Parse found lines
+    if found_lines:
+        if len(found_lines) > 1:
+            combined_line = ' '.join(reversed(found_lines))
+            if verbosity > 1:
+                print(f"    Combined {len(found_lines)} lines: '{combined_line}'", file=sys.stderr)
+        else:
+            combined_line = found_lines[0]
+
+        efternamn, fornamn = parse_name_from_text(combined_line, config, verbosity)
+
+        if efternamn and verbosity > 1:
+            lines_back = start_idx - lines.index(found_lines[-1])
+            print(f"    Found name {lines_back} lines above: {efternamn}, {fornamn}", file=sys.stderr)
+
+        return efternamn, fornamn
+
+    return "", ""
+
+
+def _find_personnummer_with_regex(
+    lines: List[str], 
+    config: Config, 
+    verbosity: int
+) -> List[Dict[str, Any]]:
+    """Find personnummer using regular expression matching.
+
+    Returns:
+        List of dictionaries with personnummer information
+    """
+    results = []
+    rejected_invalid_dates = []
+    pattern = config.personnummer_pattern
+
     for line_idx, line in enumerate(lines):
         for match in re.finditer(r'\S*' + pattern + r'\S*', line):
             full_match = match.group(0)
@@ -759,19 +908,17 @@ def find_all_personnummer_on_page(text, page_num, config, verbosity):
                 date_valid = validate_personnummer_date(cleaned_pnr)
 
             if date_valid or 'TF' in cleaned_pnr:
-                # VALID DATE - proceed with Luhn check and name extraction
+                # VALID DATE - proceed with Luhn check
                 luhn_valid = True
                 if 'TF' not in cleaned_pnr:
                     pnr_no_hyphen = cleaned_pnr.replace('-', '')
                     luhn_valid = luhn_check(pnr_no_hyphen)
 
-                overall_valid = luhn_valid  # For TF, this is True; for others, depends on Luhn
-
                 results.append({
                     'personnummer': cleaned_pnr,
                     'line_idx': line_idx,
-                    'luhn_valid': overall_valid,
-                    'date_valid': True,  # Always true here
+                    'luhn_valid': luhn_valid,
+                    'date_valid': True,
                     'luhn_check_valid': luhn_valid,
                     'extraction_type': 'normal',
                     'original_match': full_match,
@@ -788,146 +935,278 @@ def find_all_personnummer_on_page(text, page_num, config, verbosity):
                         validity_str = "(valid)"
                     print(f"  Found personnummer: {cleaned_pnr} {validity_str}", file=sys.stderr)
             else:
-                # INVALID DATE - completely reject, no name extraction
+                # INVALID DATE - completely reject
                 rejected_invalid_dates.append(cleaned_pnr)
                 if verbosity > 1:
                     print(f"  REJECTED: {cleaned_pnr} (invalid date - no name extraction)", file=sys.stderr)
 
-    # STEP 2: Only try special extraction if no valid-date personnummer found
-    if not results:
-        if verbosity > 1:
-            print(f"  No valid-date personnummer found with normal regex, trying special extraction...", file=sys.stderr)
+    return results, rejected_invalid_dates
 
-        for line_idx, line in enumerate(lines):
-            special_result = extract_special_personnummer(line, config, verbosity)
-            if special_result:
-                special_pnr, original_substring, start_pos, end_pos = special_result
-                date_valid = True
+
+def _find_personnummer_with_special_extraction(
+    lines: List[str], 
+    config: Config, 
+    verbosity: int
+) -> List[Dict[str, Any]]:
+    """Find personnummer using special extraction for mangled OCR.
+
+    Returns:
+        List of dictionaries with personnummer information
+    """
+    results = []
+    rejected_invalid_dates = []
+
+    for line_idx, line in enumerate(lines):
+        special_result = extract_special_personnummer(line, config, verbosity)
+        if special_result:
+            special_pnr, original_substring, start_pos, end_pos = special_result
+            date_valid = True
+            if 'TF' not in special_pnr:
+                date_valid = validate_personnummer_date(special_pnr)
+
+            if date_valid or 'TF' in special_pnr:
+                luhn_valid = True
                 if 'TF' not in special_pnr:
-                    date_valid = validate_personnummer_date(special_pnr)
+                    pnr_no_hyphen = special_pnr.replace('-', '')
+                    luhn_valid = luhn_check(pnr_no_hyphen)
 
-                if date_valid or 'TF' in special_pnr:
-                    luhn_valid = True
-                    if 'TF' not in special_pnr:
-                        pnr_no_hyphen = special_pnr.replace('-', '')
-                        luhn_valid = luhn_check(pnr_no_hyphen)
+                results.append({
+                    'personnummer': special_pnr,
+                    'line_idx': line_idx,
+                    'luhn_valid': luhn_valid,
+                    'date_valid': True,
+                    'luhn_check_valid': luhn_valid,
+                    'extraction_type': 'special',
+                    'original_match': original_substring,
+                    'match_start': start_pos,
+                    'match_end': end_pos
+                })
 
-                    results.append({
-                        'personnummer': special_pnr,
-                        'line_idx': line_idx,
-                        'luhn_valid': luhn_valid,
-                        'date_valid': True,
-                        'luhn_check_valid': luhn_valid,
-                        'extraction_type': 'special',
-                        'original_match': original_substring,
-                        'match_start': start_pos,
-                        'match_end': end_pos
-                    })
-
-                    if verbosity > 1:
-                        validity_str = "(TF number)" if 'TF' in special_pnr else ("(valid date, invalid Luhn - will extract names)" if not luhn_valid else "(valid)")
-                        print(f"  Found personnummer (special): {special_pnr} {validity_str}", file=sys.stderr)
-                else:
-                    rejected_invalid_dates.append(special_pnr)
-                    if verbosity > 1:
-                        print(f"  REJECTED: {special_pnr} (special - invalid date, no name extraction)", file=sys.stderr)
-
-    # Summary logging
-    if verbosity > 1:
-        if rejected_invalid_dates:
-            print(f"  Page summary: {len(results) + len(rejected_invalid_dates)} personnummer found, {len(rejected_invalid_dates)} rejected (invalid dates), {len(results)} valid for name extraction", file=sys.stderr)
-        elif results:
-            print(f"  Page summary: {len(results)} valid-date personnummer found", file=sys.stderr)
-        else:
-            print(f"  Page summary: No valid-date personnummer found", file=sys.stderr)
-
-    return results
-
-def extract_names_for_personnummer(text, selected_pnr, selected_line_idx, config, verbosity, match_info=None):
-    """Extract names for a specific selected personnummer."""
-    lines = text.split('\n')
-    pattern = config.personnummer_pattern
-
-    # Find the personnummer on its line
-    target_line = lines[selected_line_idx]
-
-    # Extract prefix (everything before personnummer) - use match info if available
-    pnr_pos = -1
-
-    if match_info and 'match_start' in match_info:
-        # Use the stored match position from extraction
-        pnr_pos = match_info['match_start']
-        if verbosity > 1:
-            extraction_type = match_info.get('extraction_type', 'unknown')
-            print(f"    Using stored match position from {extraction_type} extraction: pos {pnr_pos}", file=sys.stderr)
-    else:
-        # Fallback to searching (original logic)
-        pnr_pos = target_line.find(selected_pnr)
-        if pnr_pos == -1:
-            # Try to find pattern match
-            match = re.search(selected_pnr.replace('-', r'\-'), target_line)
-            if match:
-                pnr_pos = match.start()
-
-    prefix = target_line[:pnr_pos].strip() if pnr_pos > 0 else ""
-
-    efternamn = ""
-    fornamn = ""
-
-    if prefix:
-        efternamn, fornamn = parse_name_from_text(prefix, config, verbosity)
-        if verbosity > 1 and efternamn:
-            format_type = "comma" if ',' in prefix else "space"
-            print(f"    Found name on same line ({format_type}): {efternamn}, {fornamn}", file=sys.stderr)
-
-    # If no name found, search previous lines (existing logic remains the same)
-    if not efternamn:
-        found_lines = []
-        found_single_word = False
-
-        for prev_idx in range(selected_line_idx - 1, -1, -1):
-            prev_line = lines[prev_idx].strip()
-            if prev_line:
-                if should_filter_line(prev_line, config):
-                    if verbosity > 1:
-                        print(f"    Filtered line: '{prev_line}'", file=sys.stderr)
-                    continue
-
-                # Skip lines with personnummer
-                if re.search(pattern, prev_line) or extract_special_personnummer(prev_line, config):
-                    continue
-
-                if ',' in prev_line:
-                    found_lines.append(prev_line)
-                    break
-                else:
-                    words = clean_name(prev_line, config).split()
-                    if len(words) == 1 and words[0]:
-                        found_lines.append(prev_line)
-                        if found_single_word:
-                            break
-                        found_single_word = True
-                        continue
-                    elif len(words) > 1:
-                        found_lines.append(prev_line)
-                        break
-
-        # Parse found lines using the unified parser
-        if found_lines:
-            if len(found_lines) > 1:
-                combined_line = ' '.join(reversed(found_lines))
                 if verbosity > 1:
-                    print(f"    Combined {len(found_lines)} lines: '{combined_line}'", file=sys.stderr)
+                    validity_str = "(TF number)" if 'TF' in special_pnr else (
+                        "(valid date, invalid Luhn - will extract names)" if not luhn_valid else "(valid)"
+                    )
+                    print(f"  Found personnummer (special): {special_pnr} {validity_str}", file=sys.stderr)
             else:
-                combined_line = found_lines[0]
+                rejected_invalid_dates.append(special_pnr)
+                if verbosity > 1:
+                    print(f"  REJECTED: {special_pnr} (special - invalid date, no name extraction)", file=sys.stderr)
 
-            efternamn, fornamn = parse_name_from_text(combined_line, config, verbosity)
+    return results, rejected_invalid_dates
 
-            if efternamn and verbosity > 1:
-                lines_back = selected_line_idx - lines.index(found_lines[-1])
-                print(f"    Found name {lines_back} lines above: {efternamn}, {fornamn}", file=sys.stderr)
 
-    return efternamn, fornamn
+def _process_inheritance(
+    current_page_entries: Dict[int, List[Dict]], 
+    total_pages: int, 
+    inherit: bool, 
+    verbosity: int
+) -> Tuple[List[Dict], Dict[str, List], int, int]:
+    """Process inheritance logic for pages without personnummer.
+
+    Returns:
+        Tuple of (final_data, pnr_to_names, pages_with_pnr, pages_without_pnr)
+    """
+    final_data = []
+    pnr_to_names = defaultdict(list)
+    last_valid_entry = None
+    pages_with_pnr = 0
+    pages_without_pnr = 0
+
+    for page_num in range(1, total_pages + 1):
+        if page_num in current_page_entries:
+            page_entries = current_page_entries[page_num]
+
+            # Guarantee exactly one entry per page
+            if len(page_entries) != 1:
+                raise RuntimeError(f"Internal error: Expected exactly 1 entry for page {page_num}, got {len(page_entries)}")
+
+            entry = page_entries[0]
+            pages_with_pnr += 1
+
+            pnr = entry['personnummer']
+
+            # Track name combinations for valid personnummer
+            if pnr:
+                name_combo = (entry['efternamn'], entry['fornamn'])
+                if name_combo != ("", ""):
+                    pnr_to_names[pnr].append(name_combo)
+
+            # Add to final data
+            final_data.append({
+                'page': page_num,
+                'personnummer': pnr if pnr else "",
+                'efternamn': entry['efternamn'],
+                'fornamn': entry['fornamn'],
+                'luhn_valid': entry['luhn_valid'],
+                'was_corrected': entry.get('was_corrected', False)
+            })
+
+            # Update last valid entry for inheritance
+            if pnr:
+                last_valid_entry = {
+                    'personnummer': pnr,
+                    'efternamn': entry['efternamn'],
+                    'fornamn': entry['fornamn']
+                }
+        else:
+            # No entries on this page
+            pages_without_pnr += 1
+            if inherit and last_valid_entry:
+                if verbosity > 1:
+                    print(f"--- Page {page_num} ---", file=sys.stderr)
+                    print(f"  No personnummer found, inheriting {last_valid_entry['personnummer']} "
+                          f"({last_valid_entry['efternamn']}, {last_valid_entry['fornamn']})", 
+                          file=sys.stderr)
+                final_data.append({
+                    'page': page_num,
+                    'personnummer': last_valid_entry['personnummer'],
+                    'efternamn': last_valid_entry['efternamn'],
+                    'fornamn': last_valid_entry['fornamn'],
+                    'luhn_valid': True,
+                    'was_corrected': False
+                })
+            else:
+                if verbosity > 1:
+                    print(f"--- Page {page_num} ---", file=sys.stderr)
+                    if not inherit:
+                        print(f"  No personnummer found, inheritance disabled - empty row", file=sys.stderr)
+                    else:
+                        print(f"  No personnummer found, no previous entry to inherit - empty row", file=sys.stderr)
+                final_data.append({
+                    'page': page_num,
+                    'personnummer': "",
+                    'efternamn': "",
+                    'fornamn': "",
+                    'luhn_valid': False,
+                    'was_corrected': False
+                })
+
+    return final_data, pnr_to_names, pages_with_pnr, pages_without_pnr
+
+
+def _resolve_name_variants(
+    pnr_to_names: Dict[str, List], 
+    config: Config, 
+    verbosity: int
+) -> Dict[str, Tuple[str, str]]:
+    """Resolve name variants for each personnummer.
+
+    Returns:
+        Dictionary mapping personnummer to final (efternamn, fornamn)
+    """
+    if verbosity > 0 and pnr_to_names:
+        print("\nResolving name variants for each personnummer...", file=sys.stderr)
+
+    pnr_final_names = {}
+    scandinavian_preferences = 0
+    tied_selections = []
+
+    for pnr, name_list in pnr_to_names.items():
+        if name_list:
+            name_counter = Counter(name_list)
+
+            # Use the selection algorithm with enhanced scoring
+            selected_name = select_best_name_variant(name_counter, pnr, config, verbosity)
+
+            # Check if enhanced scoring was applied
+            most_common_by_count = name_counter.most_common(1)[0][0]
+            if selected_name != most_common_by_count:
+                if has_scandinavian_chars(selected_name[0] + selected_name[1]):
+                    scandinavian_preferences += 1
+
+            # Check for ties in original counting
+            if len(name_counter) > 1:
+                top_count = name_counter.most_common(1)[0][1]
+                ties = [(name, count) for name, count in name_counter.items() if count == top_count]
+                if len(ties) > 1:
+                    tied_selections.append((pnr, selected_name, len(ties)))
+            elif verbosity > 1:
+                # Only one variant found
+                print(f"  {pnr}: {selected_name[0]}, {selected_name[1]} (unanimous)", file=sys.stderr)
+
+            pnr_final_names[pnr] = selected_name
+
+    if scandinavian_preferences > 0 and verbosity >= 0:
+        print(f"\nApplied enhanced scoring (Scandinavian/penalty) preference to {scandinavian_preferences} names", file=sys.stderr)
+
+    if tied_selections and verbosity >= 0:
+        print(f"\nResolved {len(tied_selections)} ties in name variants:", file=sys.stderr)
+        if verbosity > 0:
+            for pnr, selected_name, num_ties in tied_selections[:10]:
+                print(f"  {pnr}: Selected '{selected_name[0]}, {selected_name[1]}' from {num_ties} equally common variants", 
+                      file=sys.stderr)
+
+    return pnr_final_names
+
+
+def _apply_final_names_to_entries(
+    final_data: List[Dict], 
+    pnr_final_names: Dict[str, Tuple[str, str]], 
+    verbosity: int
+) -> Tuple[int, int]:
+    """Apply the resolved names to all entries.
+
+    Returns:
+        Tuple of (updates_made, names_added)
+    """
+    if verbosity > 0 and pnr_final_names:
+        print("\nApplying selected names to all pages...", file=sys.stderr)
+
+    updates_made = 0
+    names_added = 0
+
+    for entry in final_data:
+        pnr = entry['personnummer']
+        if pnr and pnr in pnr_final_names:
+            final_name = pnr_final_names[pnr]
+
+            # Check if we need to add or update names
+            if entry['efternamn'] == "" and entry['fornamn'] == "":
+                entry['efternamn'] = final_name[0]
+                entry['fornamn'] = final_name[1]
+                names_added += 1
+                if verbosity > 1:
+                    print(f"  Page {entry['page']}: Added missing name for {pnr}: '{final_name[0]}, {final_name[1]}'", 
+                          file=sys.stderr)
+            elif (entry['efternamn'], entry['fornamn']) != final_name:
+                old_name = f"{entry['efternamn']}, {entry['fornamn']}"
+                entry['efternamn'] = final_name[0]
+                entry['fornamn'] = final_name[1]
+                updates_made += 1
+                if verbosity > 1:
+                    print(f"  Page {entry['page']}: Updated {pnr} from '{old_name}' to '{final_name[0]}, {final_name[1]}'", 
+                          file=sys.stderr)
+
+    return updates_made, names_added
+
+
+def extract_names_for_personnummer(
+    text: str, 
+    selected_pnr: str, 
+    selected_line_idx: int, 
+    config: Config, 
+    verbosity: int, 
+    match_info: Optional[Dict[str, Any]] = None
+) -> Tuple[str, str]:
+    """Extract names for a specific selected personnummer.
+
+    This function has been simplified by delegating to helper functions.
+    """
+    lines = text.split('\n')
+
+    # Step 1: Try same line extraction
+    efternamn, fornamn = _extract_names_from_same_line(
+        lines[selected_line_idx], selected_pnr, config, verbosity, match_info
+    )
+
+    if efternamn:
+        return efternamn, fornamn
+
+    # Step 2: Search previous lines
+    return _search_previous_lines_for_names(
+        lines, selected_line_idx, config, verbosity
+    )
+
 
 def extract_personnummer_and_names(text, page_num, config, verbosity, include_invalid=False, last_captured_pnr=None):
     """Extract personnummer and names - select ONE personnummer first, then extract names."""
@@ -1557,101 +1836,41 @@ def validate_autocorrection_requirements(invalid_pnr, efternamn, fornamn):
 
     return True, "ok"
 
-def apply_inheritance_and_resolve_names(raw_data, total_pages, inherit, config, verbosity, include_invalid):
-    """Apply inheritance and resolve name variants to produce final data."""
-    # Process inheritance and handle remaining invalid entries
-    pnr_to_names = defaultdict(list)
-    last_valid_entry = None
-    pages_with_pnr = 0
-    pages_without_pnr = 0
-    invalid_pnr_count = 0
-    final_data = []
 
+def apply_inheritance_and_resolve_names(
+    raw_data: List[Dict], 
+    total_pages: int, 
+    inherit: bool, 
+    config: Config, 
+    verbosity: int, 
+    include_invalid: bool
+) -> List[Dict[str, Any]]:
+    """Apply inheritance and resolve name variants to produce final data.
+
+    This function has been significantly simplified by delegating to helper functions.
+    """
+    # Process invalid personnummer first
+    invalid_pnr_count = 0
+    for entry in raw_data:
+        if not entry['luhn_valid']:
+            invalid_pnr_count += 1
+            if not include_invalid:
+                if verbosity >= 0:
+                    print(f"  Page {entry['page']}: {entry['personnummer']} still invalid after autocorrection attempt - "
+                          f"personnummer field will be EMPTY", file=sys.stderr)
+                entry['personnummer'] = None
+
+    # Group entries by page
     current_page_entries = defaultdict(list)
     for entry in raw_data:
         current_page_entries[entry['page']].append(entry)
 
-    # GUARANTEE: Ensure ALL pages are present exactly once, even if no personnummer found
-    for page_num in range(1, total_pages + 1):
-        if page_num in current_page_entries:
-            page_entries = current_page_entries[page_num]
+    # Step 1: Process inheritance
+    final_data, pnr_to_names, pages_with_pnr, pages_without_pnr = _process_inheritance(
+        current_page_entries, total_pages, inherit, verbosity
+    )
 
-            # GUARANTEE: Exactly one entry per page (since we now guarantee 1 personnummer per page)
-            if len(page_entries) != 1:
-                raise RuntimeError(f"Internal error: Expected exactly 1 entry for page {page_num}, got {len(page_entries)}")
-
-            entry = page_entries[0]  # Take the single guaranteed entry
-            pages_with_pnr += 1
-
-            pnr = entry['personnummer']
-
-            # Count remaining invalid after autocorrection
-            if not entry['luhn_valid']:
-                invalid_pnr_count += 1
-                if not include_invalid:
-                    if verbosity >= 0:
-                        print(f"  Page {page_num}: {pnr} still invalid after autocorrection attempt - personnummer field will be EMPTY", 
-                              file=sys.stderr)
-                    pnr = None  # Clear personnummer field
-
-            # Track name combinations for valid personnummer
-            if pnr:
-                name_combo = (entry['efternamn'], entry['fornamn'])
-                if name_combo != ("", ""):
-                    pnr_to_names[pnr].append(name_combo)
-
-            # Add to final data
-            final_data.append({
-                'page': page_num,
-                'personnummer': pnr if pnr else "",
-                'efternamn': entry['efternamn'],
-                'fornamn': entry['fornamn'],
-                'luhn_valid': entry['luhn_valid'],
-                'was_corrected': entry.get('was_corrected', False)
-            })
-
-            # Update last valid entry for inheritance
-            if pnr:
-                last_valid_entry = {
-                    'personnummer': pnr,
-                    'efternamn': entry['efternamn'],
-                    'fornamn': entry['fornamn']
-                }
-        else:
-            # No entries on this page - ALWAYS add a row for this page
-            pages_without_pnr += 1
-            if inherit and last_valid_entry:
-                if verbosity > 1:
-                    print(f"--- Page {page_num} ---", file=sys.stderr)
-                    print(f"  No personnummer found, inheriting {last_valid_entry['personnummer']} "
-                          f"({last_valid_entry['efternamn']}, {last_valid_entry['fornamn']})", 
-                          file=sys.stderr)
-                final_data.append({
-                    'page': page_num,
-                    'personnummer': last_valid_entry['personnummer'],
-                    'efternamn': last_valid_entry['efternamn'],
-                    'fornamn': last_valid_entry['fornamn'],
-                    'luhn_valid': True,
-                    'was_corrected': False
-                })
-            else:
-                if verbosity > 1:
-                    print(f"--- Page {page_num} ---", file=sys.stderr)
-                    if not inherit:
-                        print(f"  No personnummer found, inheritance disabled - empty row", 
-                              file=sys.stderr)
-                    else:
-                        print(f"  No personnummer found, no previous entry to inherit - empty row", 
-                              file=sys.stderr)
-                final_data.append({
-                    'page': page_num,
-                    'personnummer': "",
-                    'efternamn': "",
-                    'fornamn': "",
-                    'luhn_valid': False,
-                    'was_corrected': False
-                })
-
+    # Log inheritance statistics
     if verbosity >= 0:
         print(f"  Found personnummer on {pages_with_pnr} pages", file=sys.stderr)
         if pages_without_pnr > 0:
@@ -1663,91 +1882,23 @@ def apply_inheritance_and_resolve_names(raw_data, total_pages, inherit, config, 
             if include_invalid:
                 print(f"  WARNING: {invalid_pnr_count} personnummer still invalid after autocorrection", file=sys.stderr)
             else:
-                print(f"  {invalid_pnr_count} invalid personnummer (after autocorrection) will have empty field", file=sys.stderr)
-
-    # Determine most common name for each personnummer
-    if verbosity > 0 and pnr_to_names:
-        print("\nResolving name variants for each personnummer...", file=sys.stderr)
-
-    pnr_final_names = {}
-    ambiguous_names = []
-    tied_selections = []
-    scandinavian_preferences = 0
-
-    for pnr, name_list in pnr_to_names.items():
-        if name_list:
-            name_counter = Counter(name_list)
-
-            # Use the selection algorithm with enhanced scoring
-            selected_name = select_best_name_variant(name_counter, pnr, config, verbosity)
-
-            # Check if enhanced scoring was applied
-            most_common_by_count = name_counter.most_common(1)[0][0]
-            if selected_name != most_common_by_count:
-                if has_scandinavian_chars(selected_name[0] + selected_name[1]):
-                    scandinavian_preferences += 1
-
-            # Check for ambiguity (ties in original counting)
-            if len(name_counter) > 1:
-                top_count = name_counter.most_common(1)[0][1]
-                ties = [(name, count) for name, count in name_counter.items() if count == top_count]
-                if len(ties) > 1:
-                    ambiguous_names.append((pnr, ties, selected_name))
-                    tied_selections.append((pnr, selected_name, len(ties)))
-            elif verbosity > 1:
-                # Only one variant found
-                is_valid = any(e['luhn_valid'] for e in final_data if e['personnummer'] == pnr)
-                validity_str = "" if (is_valid or 'TF' in pnr) else " [INVALID LUHN]"
-                was_corrected = any(e.get('was_corrected', False) for e in final_data if e['personnummer'] == pnr)
-                corrected_str = " [AUTOCORRECTED]" if was_corrected else ""
-                print(f"  {pnr}{validity_str}{corrected_str}: {selected_name[0]}, {selected_name[1]} (unanimous)", 
+                print(f"  {invalid_pnr_count} invalid personnummer (after autocorrection) will have empty field", 
                       file=sys.stderr)
 
-            pnr_final_names[pnr] = selected_name
+    # Step 2: Resolve name variants
+    pnr_final_names = _resolve_name_variants(pnr_to_names, config, verbosity)
 
-    if scandinavian_preferences > 0 and verbosity >= 0:
-        print(f"\nApplied enhanced scoring (Scandinavian/penalty) preference to {scandinavian_preferences} names", file=sys.stderr)
+    # Step 3: Apply final names to all entries
+    updates_made, names_added = _apply_final_names_to_entries(final_data, pnr_final_names, verbosity)
 
-    if tied_selections and verbosity >= 0:
-        print(f"\nResolved {len(tied_selections)} ties in name variants:", file=sys.stderr)
-        if verbosity > 0:
-            for pnr, selected_name, num_ties in tied_selections[:10]:  # Show first 10
-                print(f"  {pnr}: Selected '{selected_name[0]}, {selected_name[1]}' from {num_ties} equally common variants", 
-                      file=sys.stderr)
-
-    # Update all entries with the most common names
-    if verbosity > 0 and pnr_final_names:
-        print("\nApplying selected names to all pages...", file=sys.stderr)
-
-    updates_made = 0
-    names_added = 0
-    for entry in final_data:
-        pnr = entry['personnummer']
-        if pnr and pnr in pnr_final_names:  # Only update if personnummer is not empty
-            final_name = pnr_final_names[pnr]
-            # Only update if current entry has no name or different name
-            if (entry['efternamn'] == "" and entry['fornamn'] == ""):
-                entry['efternamn'] = final_name[0]
-                entry['fornamn'] = final_name[1]
-                names_added += 1
-                if verbosity > 1:
-                    print(f"  Page {entry['page']}: Added missing name for {pnr}: '{final_name[0]}, {final_name[1]}'", 
-                          file=sys.stderr)
-            elif (entry['efternamn'], entry['fornamn']) != final_name:
-                old_name = f"{entry['efternamn']}, {entry['fornamn']}"
-                entry['efternamn'] = final_name[0]
-                entry['fornamn'] = final_name[1]
-                updates_made += 1
-                if verbosity > 1:
-                    print(f"  Page {entry['page']}: Updated {pnr} from '{old_name}' to '{final_name[0]}, {final_name[1]}'", 
-                          file=sys.stderr)
-
+    # Log name application statistics
     if verbosity > 0:
         if names_added > 0:
             print(f"  Added {names_added} missing names", file=sys.stderr)
         if updates_made > 0:
             print(f"  Updated {updates_made} name variants to selected version", file=sys.stderr)
 
+    # Final summary
     if verbosity >= 0:
         unique_pnr = len(set(entry['personnummer'] for entry in final_data if entry['personnummer']))
         print(f"\nSummary: {unique_pnr} unique personnummer across {total_pages} pages", file=sys.stderr)
@@ -1765,6 +1916,7 @@ def apply_inheritance_and_resolve_names(raw_data, total_pages, inherit, config, 
             print(f"  {empty_pnr_count} rows will have empty personnummer field", file=sys.stderr)
 
     return final_data
+
 
 def main():
     parser = argparse.ArgumentParser(
