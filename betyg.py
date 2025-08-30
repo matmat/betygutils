@@ -716,7 +716,7 @@ def extract_special_personnummer(line, config, verbosity=0):
         tuple: (cleaned_pnr, original_substring, start_pos, end_pos) or None
     """
     # Apply unidecode to handle em dashes and other special characters
-    decoded_line = unidecode(line)
+    decoded_line = unidecode.unidecode(line)  # FIXED: was unidecode(line)
 
     # QUICK REJECTION: Count total digits and check for minimum requirement
     digit_count = sum(1 for c in decoded_line if c.isdigit())
