@@ -61,6 +61,8 @@ class Config:
     # Scoring weights
     scandinavian_bonus: int = 1000
     all_caps_penalty: int = 50
+    excessive_length_threshold: int = 15  # Names longer than this get penalized
+    excessive_length_penalty: int = 100   # Penalty per name component over threshold
 
     # Filter keywords
     filter_keywords: list = dataclasses.field(default_factory=lambda: 
@@ -287,7 +289,7 @@ def merge_short_words_with_nearest_shortest(words, config, verbosity=0):
     return words_copy
 
 def select_best_name_variant(name_counter, pnr, config, verbosity):
-    """Select the best name variant with bias towards Scandinavian characters and against ALL CAPS."""
+    """Select the best name variant with bias towards Scandinavian characters, against ALL CAPS, and against excessive length."""
     if len(name_counter) == 1:
         return list(name_counter.keys())[0]
 
@@ -322,10 +324,19 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
                 score -= config.all_caps_penalty
                 caps_penalty = config.all_caps_penalty
 
-            scored_variants.append((name, count, scand_count, caps_penalty, score))
+            # Excessive length penalty
+            length_penalty = 0
+            if len(efternamn) > config.excessive_length_threshold:
+                length_penalty += config.excessive_length_penalty
+                score -= config.excessive_length_penalty
+            if len(fornamn) > config.excessive_length_threshold:
+                length_penalty += config.excessive_length_penalty
+                score -= config.excessive_length_penalty
+
+            scored_variants.append((name, count, scand_count, caps_penalty, length_penalty, score))
 
         # Sort by score (highest first)
-        scored_variants.sort(key=lambda x: x[4], reverse=True)
+        scored_variants.sort(key=lambda x: x[5], reverse=True)
         selected = scored_variants[0][0]
 
         if verbosity > 0:
@@ -337,11 +348,14 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
             selection_reason = None
             winner_has_scand = has_scandinavian_chars(selected[0] + selected[1])
             winner_has_caps = is_all_caps(selected[0]) or is_all_caps(selected[1])
+            winner_too_long = len(selected[0]) > config.excessive_length_threshold or len(selected[1]) > config.excessive_length_threshold
 
             # Case 1: Tie broken by advanced scoring
             if len(tied_variants) > 1:
                 if winner_has_scand:
                     selection_reason = "TIE broken by Scandinavian preference!"
+                elif not winner_too_long and any(len(v[0][0]) > config.excessive_length_threshold or len(v[0][1]) > config.excessive_length_threshold for v in tied_variants):
+                    selection_reason = "TIE broken by length preference!"
                 elif winner_has_caps:
                     selection_reason = "TIE broken by ALL CAPS penalty avoidance!"
                 else:
@@ -351,6 +365,8 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
             elif selected != max(variants, key=lambda x: x[1])[0]:
                 if winner_has_scand:
                     selection_reason = "Scandinavian preference OVERRIDES frequency!"
+                elif not winner_too_long:
+                    selection_reason = "Length preference OVERRIDES frequency!"
                 elif any(is_all_caps(v[0][0]) or is_all_caps(v[0][1]) 
                         for v in scored_variants if v[1] == max_count):
                     selection_reason = "ALL CAPS penalty avoidance OVERRIDES frequency!"
@@ -362,11 +378,13 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
                     selection_reason += " (also has Scandinavian chars)"
 
             print(f"  {pnr}: {selection_reason}", file=sys.stderr)
-            for name, count, scand_count, caps_penalty, score in scored_variants:
+            for name, count, scand_count, caps_penalty, length_penalty, score in scored_variants:
                 marker = " ← SELECTED" if name == selected else ""
                 penalties = []
                 if caps_penalty > 0:
                     penalties.append(f"-{caps_penalty} ALL CAPS")
+                if length_penalty > 0:
+                    penalties.append(f"-{length_penalty} excessive length")
 
                 penalty_str = f" ({', '.join(penalties)})" if penalties else ""
                 scand_str = f", +{scand_count * config.scandinavian_bonus} Scand" if scand_count > 0 else ""
@@ -392,6 +410,12 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
 
             if is_all_caps(efternamn) or is_all_caps(fornamn):
                 score -= config.all_caps_penalty
+
+            # Apply length penalty
+            if len(efternamn) > config.excessive_length_threshold:
+                score -= config.excessive_length_penalty
+            if len(fornamn) > config.excessive_length_threshold:
+                score -= config.excessive_length_penalty
 
             scored_variants.append((name, count, score))
 
@@ -443,6 +467,8 @@ def clean_name(name, config):
 def validate_personnummer_date(pnr):
     """Validate the date portion (YYMMDD) of a Swedish personnummer.
 
+    Supports samordningsnummer where day-of-month can be 61-91 (day + 60).
+
     Args:
         pnr: personnummer string (with or without hyphen)
 
@@ -458,29 +484,39 @@ def validate_personnummer_date(pnr):
         # Extract date components - YYMMDD
         year_str = clean_pnr[:2]   # YY (00-99, always valid)
         month_str = clean_pnr[2:4] # MM (01-12)
-        day_str = clean_pnr[4:6]   # DD (01-31)
+        day_str = clean_pnr[4:6]   # DD (01-31 or 61-91 for samordningsnummer)
 
         year = int(year_str)   # 00-99, always valid for format
         month = int(month_str) # Must be 01-12
-        day = int(day_str)     # Must be 01-31
+        day = int(day_str)     # Must be 01-31 or 61-91 (not 32-60)
 
-        # DEBUG: Print what we're validating
-        # print(f"DEBUG: Validating {pnr} → YY={year:02d} MM={month:02d} DD={day:02d}", file=sys.stderr)
+        # Check if this is a TF number
+        is_tf = 'TF' in pnr
 
         # Validate month (01-12)
         if month < 1 or month > 12:
-            # print(f"DEBUG: Invalid month {month} in {pnr}", file=sys.stderr)
             return False
 
-        # Validate day (01-31)  
-        if day < 1 or day > 31:
-            # print(f"DEBUG: Invalid day {day} in {pnr}", file=sys.stderr)
-            return False
+        # Validate day based on whether it's TF or not
+        if is_tf:
+            # TF numbers: only accept normal days (01-31)
+            if day < 1 or day > 31:
+                return False
+        else:
+            # Non-TF: accept 01-31 (normal) or 61-91 (samordningsnummer)
+            # Reject 32-60 and anything outside 01-91
+            if day < 1 or day > 91:
+                return False
+            if 32 <= day <= 60:
+                return False  # Invalid range (gap between normal and samordningsnummer)
+
+        # Determine actual day for month validation
+        actual_day = day if day <= 31 else day - 60  # Samordningsnummer: subtract 60
 
         # Additional validation: check if day makes sense for the month
-        if month == 2 and day > 29:  # February
+        if month == 2 and actual_day > 29:  # February
             return False
-        elif month in [4, 6, 9, 11] and day > 30:  # April, June, September, November
+        elif month in [4, 6, 9, 11] and actual_day > 30:  # April, June, September, November
             return False
 
         return True
