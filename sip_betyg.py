@@ -233,6 +233,293 @@ def extract_metadata_fields(row, headers, metadata_fields):
     return metadata
 
 
+def validate_arguments(args):
+    """Validate command line arguments and return processed values."""
+    # Set default template output name if not provided
+    if not args.template_output:
+        args.template_output = get_default_template_output(args.template)
+
+    # Convert input directory to Path object
+    input_dir = Path(args.input_dir)
+    if not input_dir.exists():
+        raise ValueError(f"Input directory does not exist: {input_dir}")
+    if not input_dir.is_dir():
+        raise ValueError(f"Input path is not a directory: {input_dir}")
+
+    # Determine pdf2archive command
+    pdf2archive_cmd = args.pdf2archive_path if args.pdf2archive_path else get_pdf2archive_command()
+
+    # Check for pdf2archive if PDF/A conversion is requested
+    if args.pdfa and not check_pdf2archive(pdf2archive_cmd):
+        error_msg = ["Error: pdf2archive is required for PDF/A-1B conversion but not found."]
+        if args.pdf2archive_path:
+            error_msg.append(f"Specified path not found: {args.pdf2archive_path}")
+        elif os.environ.get('PDF2ARCHIVE_PATH'):
+            error_msg.append(f"PDF2ARCHIVE_PATH not valid: {os.environ.get('PDF2ARCHIVE_PATH')}")
+        else:
+            error_msg.append("Install from: https://github.com/matteosecli/pdf2archive")
+            error_msg.append("Or specify path with --pdf2archive-path or PDF2ARCHIVE_PATH environment variable")
+        error_msg.append("Or omit --pdfa to create regular PDFs")
+        raise ValueError("\n".join(error_msg))
+
+    return input_dir, pdf2archive_cmd
+
+
+def process_csv_data(csv_file, args):
+    """Read and validate CSV data, return headers and processed rows."""
+    reader = csv.reader(csv_file)
+    rows = list(reader)
+
+    if not rows:
+        raise ValueError("CSV file is empty")
+
+    # Handle headers
+    has_header = not args.no_header
+    if has_header:
+        headers = rows[0]
+        data_rows = rows[1:]
+    else:
+        headers = [f"field_{i+1}" for i in range(len(rows[0]))]
+        data_rows = rows
+
+    if len(data_rows) == 0:
+        raise ValueError("No data rows found")
+
+    return headers, data_rows, has_header
+
+
+def parse_field_indices(args, has_header, headers):
+    """Parse field specifications and return indices."""
+    try:
+        key_field_idx = parse_field_spec(args.key_field, has_header, headers)
+
+        naming_field_indices = []
+        if args.naming_fields:
+            for field in args.naming_fields.split(','):
+                field = field.strip()
+                naming_field_indices.append(parse_field_spec(field, has_header, headers))
+
+        return key_field_idx, naming_field_indices
+    except ValueError as e:
+        raise ValueError(f"Field specification error: {e}")
+
+
+def group_rows_by_key(data_rows, key_field_idx, inherit_keys):
+    """Group rows by key field with optional inheritance."""
+    processed_rows = []
+    last_valid_key = None
+
+    for row in data_rows:
+        if len(row) < 2:
+            warnings.warn(f"Skipping row with insufficient columns: {row}")
+            continue
+
+        # Handle key inheritance
+        current_key = row[key_field_idx] if key_field_idx < len(row) else ""
+
+        if inherit_keys and not current_key.strip():
+            if last_valid_key is not None:
+                row = row.copy()  # Don't modify original
+                if len(row) <= key_field_idx:
+                    row.extend([''] * (key_field_idx - len(row) + 1))
+                row[key_field_idx] = last_valid_key
+                current_key = last_valid_key
+        elif current_key.strip():
+            last_valid_key = current_key.strip()
+
+        if not current_key.strip():
+            warnings.warn(f"Skipping row with empty key: {row}")
+            continue
+
+        processed_rows.append(row)
+
+    # Group rows by key
+    key_groups = defaultdict(list)
+    for row in processed_rows:
+        key = row[key_field_idx].strip()
+        key_groups[key].append(row)
+
+    return key_groups
+
+
+def load_template(template_path):
+    """Load and parse Jinja2 template."""
+    try:
+        with open(template_path, 'r', encoding='utf-8') as f:
+            template_content = f.read()
+        return Template(template_content)
+    except IOError as e:
+        raise IOError(f"Error reading template file: {e}")
+    except Exception as e:
+        raise ValueError(f"Error parsing template: {e}")
+
+
+def generate_pdf_filename(key, naming_field_indices, first_row):
+    """Generate PDF filename from key and additional naming fields."""
+    pdf_filename = clean_filename(key)
+
+    if naming_field_indices and first_row:
+        additional_parts = []
+        for idx in naming_field_indices:
+            if idx < len(first_row):
+                additional_parts.append(clean_filename(first_row[idx]))
+        if additional_parts:
+            pdf_filename += "_" + "_".join(additional_parts)
+
+    pdf_filename += ".pdf"
+    return pdf_filename
+
+
+def collect_pdf_pages_and_metadata(rows_for_key, input_dir, headers, args):
+    """Collect PDF pages and metadata from rows."""
+    pdf_pages = []
+    template_data = {}
+    pdf_metadata = {}
+
+    for row in rows_for_key:
+        if len(row) < 2:
+            continue
+
+        filename = row[0]
+        try:
+            page_num = int(row[1])
+        except (ValueError, IndexError):
+            warnings.warn(f"Invalid page number in row: {row}")
+            continue
+
+        # Build full path to PDF file using input directory
+        pdf_path = input_dir / filename
+
+        # Check if PDF file exists
+        if not pdf_path.exists():
+            warnings.warn(f"PDF file not found: {pdf_path}")
+            continue
+
+        pdf_pages.append((str(pdf_path), page_num))
+
+        # Collect template data (use first row's data)
+        if not template_data:
+            for i, header in enumerate(headers):
+                template_data[header] = row[i] if i < len(row) else ""
+
+            # Extract metadata for PDF/A if requested
+            if args.pdfa and args.pdfa_metadata:
+                pdf_metadata = extract_metadata_fields(row, headers, args.pdfa_metadata)
+
+    return pdf_pages, template_data, pdf_metadata
+
+
+def create_pdf_output(pdf_pages, pdf_output_path, args, pdf2archive_cmd, pdf_metadata):
+    """Create PDF output with optional PDF/A conversion."""
+    if not pdf_pages:
+        return False
+
+    if args.pdfa:
+        # Use temporary file for intermediate PDF
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+
+        try:
+            # First combine pages to temporary file
+            if combine_pdf_pages(pdf_pages, temp_path, 
+                               remove_metadata=not args.preserve_metadata, 
+                               verbose=args.verbose):
+                # Convert to PDF/A
+                clean_meta = not (args.pdfa_metadata or args.preserve_metadata)
+
+                if convert_to_pdfa_with_pdf2archive(
+                    temp_path, 
+                    pdf_output_path,
+                    pdf2archive_cmd=pdf2archive_cmd,
+                    metadata=pdf_metadata if args.pdfa_metadata else None,
+                    quality=args.pdfa_quality,
+                    clean_metadata=clean_meta,
+                    verbose=args.verbose
+                ):
+                    metadata_info = ""
+                    if args.pdfa_metadata:
+                        metadata_info = " (with metadata)"
+                    elif not args.preserve_metadata:
+                        metadata_info = " (metadata cleaned)"
+                    print(f"PDF/A-1B{metadata_info}: {pdf_output_path}")
+                    return True
+                else:
+                    # Fall back to regular PDF if conversion fails
+                    shutil.move(temp_path, pdf_output_path)
+                    warnings.warn(f"PDF/A conversion failed, created regular PDF: {pdf_output_path}")
+                    return True
+            else:
+                warnings.warn(f"Failed to combine pages")
+                return False
+
+        finally:
+            # Clean up temporary file
+            if temp_path.exists():
+                temp_path.unlink()
+
+    else:
+        # Direct combination without PDF/A conversion
+        if combine_pdf_pages(pdf_pages, pdf_output_path, 
+                           remove_metadata=not args.preserve_metadata,
+                           verbose=args.verbose):
+            metadata_info = " (metadata removed)" if not args.preserve_metadata else ""
+            print(f"PDF created{metadata_info}: {pdf_output_path}")
+            return True
+        else:
+            warnings.warn(f"Failed to create PDF")
+            return False
+
+
+def generate_template_output(template, template_data, output_path, verbose):
+    """Generate template file from data."""
+    try:
+        template_output = template.render(**template_data)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(template_output)
+        if not verbose:
+            print(f"Template: {output_path}")
+        else:
+            print(f"  Template created: {output_path}")
+        return True
+    except Exception as e:
+        warnings.warn(f"Error generating template file: {e}")
+        return False
+
+
+def process_key_group(key, rows_for_key, args, input_dir, output_dir, headers, 
+                     naming_field_indices, template, pdf2archive_cmd, current_date):
+    """Process a single key group - create PDF and template files."""
+    # Create key subdirectory
+    key_dir = output_dir / clean_filename(key)
+    key_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.verbose:
+        print(f"\nProcessing key: {key}")
+
+    # Collect PDF pages and metadata
+    pdf_pages, template_data, pdf_metadata = collect_pdf_pages_and_metadata(
+        rows_for_key, input_dir, headers, args
+    )
+
+    # Generate PDF filename
+    pdf_filename = generate_pdf_filename(
+        key, naming_field_indices, rows_for_key[0] if rows_for_key else []
+    )
+
+    # Add automatic fields to template data
+    template_data['processing_date'] = current_date
+    template_data['pdf_filename'] = pdf_filename
+
+    # Create PDF output
+    if pdf_pages:
+        pdf_output_path = key_dir / pdf_filename
+        create_pdf_output(pdf_pages, pdf_output_path, args, pdf2archive_cmd, pdf_metadata)
+
+    # Generate template file
+    template_path = key_dir / args.template_output
+    generate_template_output(template, template_data, template_path, args.verbose)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Split and combine PDF pages based on CSV metadata with optional PDF/A-1B output",
@@ -336,273 +623,64 @@ PDF/A-1B COMPLIANCE:
 
     args = parser.parse_args()
 
-    # Set default template output name if not provided
-    if not args.template_output:
-        args.template_output = get_default_template_output(args.template)
-
-    # Convert input directory to Path object
-    input_dir = Path(args.input_dir)
-    if not input_dir.exists():
-        print(f"Error: Input directory does not exist: {input_dir}", file=sys.stderr)
-        sys.exit(1)
-    if not input_dir.is_dir():
-        print(f"Error: Input path is not a directory: {input_dir}", file=sys.stderr)
-        sys.exit(1)
-
-    # Get current date in ISO format for templates
-    current_date = date.today().isoformat()
-
-    # Determine pdf2archive command
-    pdf2archive_cmd = args.pdf2archive_path if args.pdf2archive_path else get_pdf2archive_command()
-
-    # Check for pdf2archive if PDF/A conversion is requested
-    if args.pdfa and not check_pdf2archive(pdf2archive_cmd):
-        print(f"Error: pdf2archive is required for PDF/A-1B conversion but not found.", file=sys.stderr)
-        if args.pdf2archive_path:
-            print(f"Specified path not found: {args.pdf2archive_path}", file=sys.stderr)
-        elif os.environ.get('PDF2ARCHIVE_PATH'):
-            print(f"PDF2ARCHIVE_PATH not valid: {os.environ.get('PDF2ARCHIVE_PATH')}", file=sys.stderr)
-        else:
-            print("Install from: https://github.com/matteosecli/pdf2archive", file=sys.stderr)
-            print("Or specify path with --pdf2archive-path or PDF2ARCHIVE_PATH environment variable", file=sys.stderr)
-        print("Or omit --pdfa to create regular PDFs", file=sys.stderr)
-        sys.exit(1)
-
-    # Read CSV file
-    if args.csv_file == '-':
-        csv_file = sys.stdin
-    else:
-        try:
-            csv_file = open(args.csv_file, 'r', newline='', encoding='utf-8')
-        except IOError as e:
-            print(f"Error opening CSV file: {e}", file=sys.stderr)
-            sys.exit(1)
-
     try:
-        # Read CSV data
-        reader = csv.reader(csv_file)
-        rows = list(reader)
+        # Validate arguments and setup environment
+        input_dir, pdf2archive_cmd = validate_arguments(args)
 
-        if not rows:
-            print("Error: CSV file is empty", file=sys.stderr)
-            sys.exit(1)
+        # Get current date in ISO format for templates
+        current_date = date.today().isoformat()
 
-        # Handle headers
-        has_header = not args.no_header
-        if has_header:
-            headers = rows[0]
-            data_rows = rows[1:]
+        # Open CSV file
+        if args.csv_file == '-':
+            csv_file = sys.stdin
         else:
-            headers = [f"field_{i+1}" for i in range(len(rows[0]))]
-            data_rows = rows
-
-        if len(data_rows) == 0:
-            print("Error: No data rows found", file=sys.stderr)
-            sys.exit(1)
-
-        # Parse field specifications
-        try:
-            key_field_idx = parse_field_spec(args.key_field, has_header, headers)
-
-            naming_field_indices = []
-            if args.naming_fields:
-                for field in args.naming_fields.split(','):
-                    field = field.strip()
-                    naming_field_indices.append(parse_field_spec(field, has_header, headers))
-        except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        # Process rows with key inheritance if enabled
-        processed_rows = []
-        last_valid_key = None
-
-        for row in data_rows:
-            if len(row) < 2:
-                warnings.warn(f"Skipping row with insufficient columns: {row}")
-                continue
-
-            # Handle key inheritance
-            current_key = row[key_field_idx] if key_field_idx < len(row) else ""
-
-            if args.inherit_keys and not current_key.strip():
-                if last_valid_key is not None:
-                    row = row.copy()  # Don't modify original
-                    if len(row) <= key_field_idx:
-                        row.extend([''] * (key_field_idx - len(row) + 1))
-                    row[key_field_idx] = last_valid_key
-                    current_key = last_valid_key
-            elif current_key.strip():
-                last_valid_key = current_key.strip()
-
-            if not current_key.strip():
-                warnings.warn(f"Skipping row with empty key: {row}")
-                continue
-
-            processed_rows.append(row)
-
-        # Group rows by key (stable sort)
-        key_groups = defaultdict(list)
-        for row in processed_rows:
-            key = row[key_field_idx].strip()
-            key_groups[key].append(row)
-
-        # Sort keys, but maintain order within each group (stable)
-        sorted_keys = sorted(key_groups.keys())
-
-        # Load Jinja2 template
-        try:
-            with open(args.template, 'r', encoding='utf-8') as f:
-                template_content = f.read()
-            template = Template(template_content)
-        except IOError as e:
-            print(f"Error reading template file: {e}", file=sys.stderr)
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error parsing template: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        # Create output directory
-        output_dir = Path(args.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        # Process each key group
-        for key in sorted_keys:
-            rows_for_key = key_groups[key]
-
-            # Create key subdirectory
-            key_dir = output_dir / clean_filename(key)
-            key_dir.mkdir(parents=True, exist_ok=True)
-
-            if args.verbose:
-                print(f"\nProcessing key: {key}")
-
-            # Collect PDF pages
-            pdf_pages = []
-            template_data = {}
-            pdf_metadata = {}
-
-            for row in rows_for_key:
-                if len(row) < 2:
-                    continue
-
-                filename = row[0]
-                try:
-                    page_num = int(row[1])
-                except (ValueError, IndexError):
-                    warnings.warn(f"Invalid page number in row: {row}")
-                    continue
-
-                # Build full path to PDF file using input directory
-                pdf_path = input_dir / filename
-
-                # Check if PDF file exists
-                if not pdf_path.exists():
-                    warnings.warn(f"PDF file not found: {pdf_path}")
-                    continue
-
-                pdf_pages.append((str(pdf_path), page_num))
-
-                # Collect template data (use first row's data)
-                if not template_data:
-                    for i, header in enumerate(headers):
-                        template_data[header] = row[i] if i < len(row) else ""
-
-                    # Extract metadata for PDF/A if requested
-                    if args.pdfa and args.pdfa_metadata:
-                        pdf_metadata = extract_metadata_fields(row, headers, args.pdfa_metadata)
-
-            # Generate PDF filename
-            pdf_filename = clean_filename(key)
-            if naming_field_indices:
-                additional_parts = []
-                first_row = rows_for_key[0] if rows_for_key else []
-                for idx in naming_field_indices:
-                    if idx < len(first_row):
-                        additional_parts.append(clean_filename(first_row[idx]))
-                if additional_parts:
-                    pdf_filename += "_" + "_".join(additional_parts)
-            pdf_filename += ".pdf"
-
-            # Add automatic fields to template data
-            template_data['processing_date'] = current_date
-            template_data['pdf_filename'] = pdf_filename
-
-            # Combine PDF pages
-            if pdf_pages:
-                pdf_output_path = key_dir / pdf_filename
-
-                if args.pdfa:
-                    # Use temporary file for intermediate PDF
-                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                        temp_path = Path(temp_file.name)
-
-                    try:
-                        # First combine pages to temporary file
-                        # Remove metadata unless user wants to preserve it
-                        if combine_pdf_pages(pdf_pages, temp_path, 
-                                           remove_metadata=not args.preserve_metadata, 
-                                           verbose=args.verbose):
-                            # Convert to PDF/A
-                            # Clean metadata by default unless user provides metadata or wants to preserve
-                            clean_meta = not (args.pdfa_metadata or args.preserve_metadata)
-
-                            if convert_to_pdfa_with_pdf2archive(
-                                temp_path, 
-                                pdf_output_path,
-                                pdf2archive_cmd=pdf2archive_cmd,
-                                metadata=pdf_metadata if args.pdfa_metadata else None,
-                                quality=args.pdfa_quality,
-                                clean_metadata=clean_meta,
-                                verbose=args.verbose
-                            ):
-                                metadata_info = ""
-                                if args.pdfa_metadata:
-                                    metadata_info = " (with metadata)"
-                                elif not args.preserve_metadata:
-                                    metadata_info = " (metadata cleaned)"
-                                print(f"PDF/A-1B{metadata_info}: {pdf_output_path}")
-                            else:
-                                # Fall back to regular PDF if conversion fails
-                                shutil.move(temp_path, pdf_output_path)
-                                warnings.warn(f"PDF/A conversion failed, created regular PDF: {pdf_output_path}")
-                        else:
-                            warnings.warn(f"Failed to combine pages for {key}")
-
-                    finally:
-                        # Clean up temporary file
-                        if temp_path.exists():
-                            temp_path.unlink()
-
-                else:
-                    # Direct combination without PDF/A conversion
-                    # Remove metadata unless user wants to preserve it
-                    if combine_pdf_pages(pdf_pages, pdf_output_path, 
-                                       remove_metadata=not args.preserve_metadata,
-                                       verbose=args.verbose):
-                        metadata_info = " (metadata removed)" if not args.preserve_metadata else ""
-                        print(f"PDF created{metadata_info}: {pdf_output_path}")
-                    else:
-                        warnings.warn(f"Failed to create PDF for {key}")
-
-            # Generate template file
             try:
-                template_output = template.render(**template_data)
-                template_path = key_dir / args.template_output
-                with open(template_path, 'w', encoding='utf-8') as f:
-                    f.write(template_output)
-                if not args.verbose:
-                    print(f"Template: {template_path}")
-                else:
-                    print(f"  Template created: {template_path}")
-            except Exception as e:
-                warnings.warn(f"Error generating template file for key '{key}': {e}")
+                csv_file = open(args.csv_file, 'r', newline='', encoding='utf-8')
+            except IOError as e:
+                print(f"Error opening CSV file: {e}", file=sys.stderr)
+                sys.exit(1)
 
-    finally:
-        if args.csv_file != '-':
-            csv_file.close()
+        try:
+            # Process CSV data
+            headers, data_rows, has_header = process_csv_data(csv_file, args)
+
+            # Parse field specifications
+            key_field_idx, naming_field_indices = parse_field_indices(args, has_header, headers)
+
+            # Group rows by key with optional inheritance
+            key_groups = group_rows_by_key(data_rows, key_field_idx, args.inherit_keys)
+
+            # Sort keys for consistent output
+            sorted_keys = sorted(key_groups.keys())
+
+            # Load template
+            template = load_template(args.template)
+
+            # Create output directory
+            output_dir = Path(args.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Process each key group
+            for key in sorted_keys:
+                process_key_group(
+                    key, key_groups[key], args, input_dir, output_dir, 
+                    headers, naming_field_indices, template, pdf2archive_cmd, current_date
+                )
+
+        finally:
+            if args.csv_file != '-':
+                csv_file.close()
+
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except IOError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-
