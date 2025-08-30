@@ -18,6 +18,7 @@ import threading
 import time
 import unicodedata
 import dataclasses
+import unidecode
 from typing import List, Dict, Any, Tuple, Optional
 
 @dataclasses.dataclass
@@ -695,42 +696,158 @@ def should_filter_line(line, config):
     line_lower = line.lower()
     return any(keyword in line_lower for keyword in config.filter_keywords)
 
+
 def extract_special_personnummer(line, config, verbosity=0):
-    """Try to extract personnummer from a line with exactly 10 digits and 1 hyphen.
-    Returns tuple: (cleaned_pnr, original_substring, start_pos, end_pos) or None"""
-    # Count digits and hyphens in the line
-    digit_count = sum(1 for c in line if c.isdigit())
-    hyphen_count = line.count('-')
+    """Extract personnummer from a line with flexible formatting.
 
-    # Must have exactly 10 digits and 1 hyphen
-    if digit_count != 10 or hyphen_count != 1:
+    Requirements:
+    - Line must have at least 8 digits total (minimum for TF numbers: 6+2)
+    - Regular numbers need 10 digits (6+4), TF numbers need 8 digits (6+2) plus T and F
+    - Find hyphen(s) that are next to each other or separated by spaces only
+    - Search outward from hyphen to find digits
+    - RIGHT of hyphen: either 4 digits OR T,F,2digits
+    - LEFT of hyphen: 6 digits
+    - Between last left digit and hyphen: only non-digit, non-hyphen chars
+    - Between hyphen and first right element: only non-digit, non-hyphen (non-T for TF) chars
+    - No hyphens allowed between digits on either side
+    - If multiple matches, return the RIGHTMOST one
+
+    Returns:
+        tuple: (cleaned_pnr, original_substring, start_pos, end_pos) or None
+    """
+    # Apply unidecode to handle em dashes and other special characters
+    decoded_line = unidecode(line)
+
+    # QUICK REJECTION: Count total digits and check for minimum requirement
+    digit_count = sum(1 for c in decoded_line if c.isdigit())
+
+    # Minimum 8 digits needed (for TF numbers: 6 before + 2 after)
+    # Regular numbers need 10 (6 before + 4 after)
+    if digit_count < 8:
+        return None  # Quick rejection - not enough digits
+
+    # Find all hyphen sequences (one or more hyphens, possibly separated by spaces)
+    hyphen_pattern = r'-(?:\s*-)*'
+    hyphen_matches = list(re.finditer(hyphen_pattern, decoded_line))
+
+    if not hyphen_matches:
         return None
 
-    # Find first and last digit positions
-    first_digit_pos = -1
-    last_digit_pos = -1
+    # Process from rightmost to leftmost hyphen sequence
+    for hyphen_match in reversed(hyphen_matches):
+        hyphen_start = hyphen_match.start()
+        hyphen_end = hyphen_match.end()
 
-    for i, c in enumerate(line):
-        if c.isdigit():
-            if first_digit_pos == -1:
-                first_digit_pos = i
-            last_digit_pos = i
+        # === SEARCH RIGHT FROM HYPHEN ===
+        right_part = decoded_line[hyphen_end:]
+        right_is_tf = False
+        right_end_pos = hyphen_end
+        tf_digits = []
+        right_digits = []
 
-    if first_digit_pos == -1 or last_digit_pos == -1:
-        return None
+        # Look for first significant character (digit or T for TF number)
+        first_right_char_pos = -1
+        for i, char in enumerate(right_part):
+            if char == '-':
+                # Another hyphen found before any digit/T - invalid
+                break
+            if char.isdigit() or char.upper() == 'T':
+                first_right_char_pos = i
+                break
 
-    # Extract substring from first to last digit
-    candidate_part = line[first_digit_pos:last_digit_pos + 1]
-    original_substring = candidate_part  # Keep the original with spaces
+        if first_right_char_pos == -1:
+            continue  # No digits or T found, try next hyphen
 
-    # Remove everything that's not digit or hyphen for pattern matching
-    cleaned = re.sub(r'[^0-9-]', '', candidate_part)
+        # Check if it's a TF number (starts with T)
+        if right_part[first_right_char_pos].upper() == 'T':
+            t_pos = first_right_char_pos
+            f_pos = -1
 
-    # Check if it matches the pattern now
-    if re.match(f'^{config.personnummer_pattern}$', cleaned):
+            # Find F after T (no hyphens allowed)
+            for i in range(t_pos + 1, len(right_part)):
+                if right_part[i] == '-':
+                    break  # Hyphen found, invalid TF
+                if right_part[i].upper() == 'F':
+                    f_pos = i
+                    break
+
+            if f_pos > t_pos:
+                # Find 2 digits after F (no hyphens allowed)
+                for i in range(f_pos + 1, len(right_part)):
+                    if right_part[i] == '-':
+                        break  # Hyphen found, stop
+                    if right_part[i].isdigit():
+                        tf_digits.append(right_part[i])
+                        if len(tf_digits) == 2:
+                            right_is_tf = True
+                            right_end_pos = hyphen_end + i + 1
+                            break
+
+        # If not TF, collect 4 digits
+        if not right_is_tf and right_part[first_right_char_pos].isdigit():
+            for i in range(first_right_char_pos, len(right_part)):
+                if right_part[i] == '-':
+                    break  # Hyphen found, stop
+                if right_part[i].isdigit():
+                    right_digits.append(right_part[i])
+                    if len(right_digits) == 4:
+                        right_end_pos = hyphen_end + i + 1
+                        break
+
+        # Check if we got valid right side
+        if not (right_is_tf or len(right_digits) == 4):
+            continue  # Invalid right side, try next hyphen
+
+        # === SEARCH LEFT FROM HYPHEN ===
+        left_part = decoded_line[:hyphen_start]
+        left_digits = []
+        left_start_pos = 0
+
+        # Find last digit position (searching backwards)
+        last_digit_pos = -1
+        for i in range(len(left_part) - 1, -1, -1):
+            if left_part[i].isdigit():
+                last_digit_pos = i
+                break
+
+        if last_digit_pos == -1:
+            continue  # No digits on left side
+
+        # Check that between last digit and hyphen there are no digits or hyphens
+        between_last_digit_and_hyphen = left_part[last_digit_pos + 1:]
+        if any(c.isdigit() or c == '-' for c in between_last_digit_and_hyphen):
+            continue  # Invalid characters between last digit and hyphen
+
+        # Collect 6 digits going backwards (no hyphens allowed between them)
+        for i in range(last_digit_pos, -1, -1):
+            char = left_part[i]
+            if char == '-':
+                # Hyphen found while collecting digits
+                if len(left_digits) < 6:
+                    break  # Not enough digits
+            elif char.isdigit():
+                left_digits.insert(0, char)
+                if len(left_digits) == 6:
+                    left_start_pos = i
+                    break
+
+        # Check if we got 6 digits on the left
+        if len(left_digits) != 6:
+            continue
+
+        # === CONSTRUCT RESULT ===
+        if right_is_tf:
+            cleaned_pnr = ''.join(left_digits) + '-TF' + ''.join(tf_digits)
+        else:
+            cleaned_pnr = ''.join(left_digits) + '-' + ''.join(right_digits)
+
+        # Extract the original substring for logging
+        original_substring = line[left_start_pos:right_end_pos]
+
         if verbosity > 1:
-            print(f"    Special extraction: '{line.strip()}' → found '{original_substring}' → cleaned '{cleaned}'", file=sys.stderr)
-        return (cleaned, original_substring, first_digit_pos, last_digit_pos + 1)
+            print(f"    Special extraction: '{line.strip()}' → found '{original_substring}' → cleaned '{cleaned_pnr}'", file=sys.stderr)
+
+        return (cleaned_pnr, original_substring, left_start_pos, right_end_pos)
 
     return None
 
@@ -1070,67 +1187,34 @@ def _find_personnummer_with_regex(
     return results, rejected_with_reasons
 
 
-def _find_personnummer_with_special_extraction(
-    lines: List[str], 
-    config: Config, 
-    verbosity: int
-) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
-    """Find personnummer using special extraction for mangled OCR.
+def _find_personnummer_with_special_extraction(line, config, verbosity=0):
+    """Find personnummer in a line, trying standard extraction first, then special.
+
+    Args:
+        line: Line to search
+        config: Configuration dictionary
+        verbosity: Debug output level
 
     Returns:
-        Tuple of (results, rejected_with_reasons)
+        tuple: (cleaned_pnr, original_substring, start_pos, end_pos) or None
     """
-    results = []
-    rejected_with_reasons = []
+    # First try standard extraction
+    result = _find_personnummer_in_line(line, config)
 
-    for line_idx, line in enumerate(lines):
-        special_result = extract_special_personnummer(line, config, verbosity)
-        if special_result:
-            special_pnr, original_substring, start_pos, end_pos = special_result
+    if result:
+        if verbosity > 1:
+            cleaned_pnr, original, start, end = result
+            print(f"    Standard extraction: '{line.strip()}' → found '{original}' → cleaned '{cleaned_pnr}'", file=sys.stderr)
+        return result
 
-            date_valid, rejection_reason, is_samordningsnummer, is_early_rejection = validate_personnummer_date(special_pnr, verbosity)
+    # If standard extraction failed, try special extraction
+    result = extract_special_personnummer(line, config, verbosity)
 
-            if is_early_rejection:
-                # EARLY REJECTION - no name extraction, no autocorrection
-                rejected_with_reasons.append((special_pnr, rejection_reason))
-                if verbosity > 1:
-                    print(f"  EARLY REJECTED (special): {special_pnr} ({rejection_reason} - no name extraction)", file=sys.stderr)
-            else:
-                # Either valid or late rejection - proceed with name extraction
-                luhn_valid = True
-                if 'TF' not in special_pnr:
-                    pnr_no_hyphen = special_pnr.replace('-', '')
-                    luhn_valid = luhn_check(pnr_no_hyphen)
+    if result and verbosity > 1:
+        cleaned_pnr, original, start, end = result
+        print(f"    Using special extraction for: '{line.strip()}'", file=sys.stderr)
 
-                results.append({
-                    'personnummer': special_pnr,
-                    'line_idx': line_idx,
-                    'luhn_valid': luhn_valid,
-                    'date_valid': date_valid,
-                    'luhn_check_valid': luhn_valid,
-                    'is_samordningsnummer': is_samordningsnummer,
-                    'extraction_type': 'special',
-                    'original_match': original_substring,
-                    'match_start': start_pos,
-                    'match_end': end_pos,
-                    'rejection_reason': rejection_reason if not date_valid else None
-                })
-
-                if verbosity > 1:
-                    if 'TF' in special_pnr:
-                        if date_valid:
-                            validity_str = "(valid TF number)"
-                        else:
-                            validity_str = f"(invalid TF number: {rejection_reason} - will attempt autocorrection)"
-                    elif not date_valid:
-                        validity_str = f"(invalid date: {rejection_reason} - will attempt name extraction and autocorrection)"
-                    elif is_samordningsnummer:
-                        validity_str = "(valid samordningsnummer)" if luhn_valid else "(valid samordningsnummer date, invalid Luhn)"
-                    else:
-                        validity_str = "(valid)" if luhn_valid else "(valid date, invalid Luhn)"
-                    print(f"  Found personnummer (special): {special_pnr} {validity_str}", file=sys.stderr)
-
-    return results, rejected_with_reasons
+    return result
 
 
 def _process_inheritance(
