@@ -1187,34 +1187,80 @@ def _find_personnummer_with_regex(
     return results, rejected_with_reasons
 
 
-def _find_personnummer_with_special_extraction(line, config, verbosity=0):
-    """Find personnummer in a line, trying standard extraction first, then special.
+def _find_personnummer_with_special_extraction(
+    lines: List[str], 
+    config: Config, 
+    verbosity: int
+) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
+    """Find personnummer using special extraction on all lines.
 
     Args:
-        line: Line to search
-        config: Configuration dictionary
+        lines: List of text lines to search
+        config: Configuration object
         verbosity: Debug output level
 
     Returns:
-        tuple: (cleaned_pnr, original_substring, start_pos, end_pos) or None
+        Tuple of (results, rejected_with_reasons)
     """
-    # First try standard extraction
-    result = _find_personnummer_in_line(line, config)
+    results = []
+    rejected_with_reasons = []
 
-    if result:
-        if verbosity > 1:
-            cleaned_pnr, original, start, end = result
-            print(f"    Standard extraction: '{line.strip()}' → found '{original}' → cleaned '{cleaned_pnr}'", file=sys.stderr)
-        return result
+    for line_idx, line in enumerate(lines):
+        # Try special extraction on this line
+        special_result = extract_special_personnummer(line, config, verbosity)
 
-    # If standard extraction failed, try special extraction
-    result = extract_special_personnummer(line, config, verbosity)
+        if special_result:
+            cleaned_pnr, original_substring, start_pos, end_pos = special_result
 
-    if result and verbosity > 1:
-        cleaned_pnr, original, start, end = result
-        print(f"    Using special extraction for: '{line.strip()}'", file=sys.stderr)
+            # Validate the extracted personnummer
+            date_valid, rejection_reason, is_samordningsnummer, is_early_rejection = validate_personnummer_date(cleaned_pnr, verbosity)
 
-    return result
+            if is_early_rejection:
+                # EARLY REJECTION - no name extraction
+                rejected_with_reasons.append((cleaned_pnr, rejection_reason))
+                if verbosity > 1:
+                    print(f"  EARLY REJECTED (special): {cleaned_pnr} ({rejection_reason})", file=sys.stderr)
+            else:
+                # Either valid or late rejection - proceed with result
+                luhn_valid = True
+                if 'TF' not in cleaned_pnr:
+                    pnr_no_hyphen = cleaned_pnr.replace('-', '')
+                    luhn_valid = luhn_check(pnr_no_hyphen)
+
+                results.append({
+                    'personnummer': cleaned_pnr,
+                    'line_idx': line_idx,
+                    'luhn_valid': luhn_valid,
+                    'date_valid': date_valid,
+                    'luhn_check_valid': luhn_valid,
+                    'is_samordningsnummer': is_samordningsnummer,
+                    'extraction_type': 'special',
+                    'original_match': original_substring,
+                    'match_start': start_pos,
+                    'match_end': end_pos,
+                    'rejection_reason': rejection_reason if not date_valid else None
+                })
+
+                if verbosity > 1:
+                    if 'TF' in cleaned_pnr:
+                        if date_valid:
+                            validity_str = "(valid TF number)"
+                        else:
+                            validity_str = f"(invalid TF number: {rejection_reason})"
+                    elif not date_valid:
+                        validity_str = f"(invalid date: {rejection_reason})"
+                    elif is_samordningsnummer:
+                        if not luhn_valid:
+                            validity_str = "(valid samordningsnummer date, invalid Luhn)"
+                        else:
+                            validity_str = "(valid samordningsnummer)"
+                    elif not luhn_valid:
+                        validity_str = "(valid date, invalid Luhn)"
+                    else:
+                        validity_str = "(valid)"
+                    print(f"  Found personnummer (special): {cleaned_pnr} {validity_str}", file=sys.stderr)
+
+    return results, rejected_with_reasons
 
 
 def _process_inheritance(
