@@ -465,66 +465,86 @@ def clean_name(name, config):
 
     return cleaned
 
-def validate_personnummer_date(pnr):
+def validate_personnummer_date(pnr, verbosity=0):
     """Validate the date portion (YYMMDD) of a Swedish personnummer.
 
     Supports samordningsnummer where day-of-month can be 61-91 (day + 60).
 
     Args:
         pnr: personnummer string (with or without hyphen)
+        verbosity: verbosity level for detailed logging
 
     Returns:
-        bool: True if the date portion is valid, False otherwise
+        tuple: (is_valid, rejection_reason, is_samordningsnummer)
     """
     # Remove hyphen and ensure we have at least 6 digits
     clean_pnr = pnr.replace('-', '')
     if len(clean_pnr) < 6:
-        return False
+        return (False, "too short (less than 6 digits)", False)
 
     try:
         # Extract date components - YYMMDD
         year_str = clean_pnr[:2]   # YY (00-99, always valid)
-        month_str = clean_pnr[2:4] # MM (01-12)
+        month_str = clean_pnr[2:4] # MM (01-12 valid, 20-99 reject early, 13-19 could be autocorrected)
         day_str = clean_pnr[4:6]   # DD (01-31 or 61-91 for samordningsnummer)
 
         year = int(year_str)   # 00-99, always valid for format
-        month = int(month_str) # Must be 01-12
+        month = int(month_str) # Must be 01-12 for valid, 20-99 reject early
         day = int(day_str)     # Must be 01-31 or 61-91 (not 32-60)
 
         # Check if this is a TF number
         is_tf = 'TF' in pnr
 
-        # Validate month (01-12)
-        if month < 1 or month > 12:
-            return False
+        # Determine if this is a samordningsnummer
+        is_samordningsnummer = 61 <= day <= 91
+
+        # Validate month
+        if month < 1:
+            return (False, f"invalid month {month_str} (less than 01)", False)
+        elif month > 19:
+            # Reject months 20-99 early (clearly invalid)
+            return (False, f"invalid month {month_str} (greater than 19 - organizational number?)", False)
+        elif month > 12:
+            # Months 13-19 could potentially be autocorrected
+            if verbosity > 1:
+                print(f"    Month {month_str} (13-19 range) - could be autocorrected later", file=sys.stderr)
+            return (False, f"invalid month {month_str} (13-19 range - possible OCR error)", False)
 
         # Validate day based on whether it's TF or not
         if is_tf:
             # TF numbers: only accept normal days (01-31)
             if day < 1 or day > 31:
-                return False
+                return (False, f"invalid day {day_str} for TF number (must be 01-31)", False)
         else:
             # Non-TF: accept 01-31 (normal) or 61-91 (samordningsnummer)
             # Reject 32-60 and anything outside 01-91
-            if day < 1 or day > 91:
-                return False
-            if 32 <= day <= 60:
-                return False  # Invalid range (gap between normal and samordningsnummer)
+            if day < 1:
+                return (False, f"invalid day {day_str} (less than 01)", False)
+            elif day > 91:
+                return (False, f"invalid day {day_str} (greater than 91)", False)
+            elif 32 <= day <= 60:
+                return (False, f"invalid day {day_str} (32-60 range not allowed)", False)
 
         # Determine actual day for month validation
         actual_day = day if day <= 31 else day - 60  # Samordningsnummer: subtract 60
 
         # Additional validation: check if day makes sense for the month
         if month == 2 and actual_day > 29:  # February
-            return False
+            return (False, f"invalid day {actual_day} for February", is_samordningsnummer)
         elif month in [4, 6, 9, 11] and actual_day > 30:  # April, June, September, November
-            return False
+            month_names = {4: "April", 6: "June", 9: "September", 11: "November"}
+            return (False, f"invalid day {actual_day} for {month_names[month]}", is_samordningsnummer)
 
-        return True
+        # Valid date
+        if is_samordningsnummer and verbosity > 1:
+            print(f"    Valid samordningsnummer date: {year_str}-{month_str}-{day_str} (actual day: {actual_day})", 
+                  file=sys.stderr)
+
+        return (True, None, is_samordningsnummer)
 
     except ValueError:
         # Non-numeric characters in date portion
-        return False
+        return (False, "non-numeric characters in date portion", False)
 
 def luhn_check(number_str):
     """Validate Swedish personnummer using Luhn algorithm."""
@@ -924,11 +944,11 @@ def _find_personnummer_with_regex(
     lines: List[str], 
     config: Config, 
     verbosity: int
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Find personnummer using regular expression matching.
 
     Returns:
-        List of dictionaries with personnummer information
+        Tuple of (results, rejected_invalid_dates)
     """
     results = []
     rejected_invalid_dates = []
@@ -940,9 +960,12 @@ def _find_personnummer_with_regex(
             cleaned_pnr = re.search(pattern, full_match).group(0)
 
             # Validate date portion first (TF numbers always pass)
-            date_valid = True
             if 'TF' not in cleaned_pnr:
-                date_valid = validate_personnummer_date(cleaned_pnr)
+                date_valid, rejection_reason, is_samordningsnummer = validate_personnummer_date(cleaned_pnr, verbosity)
+            else:
+                date_valid = True
+                rejection_reason = None
+                is_samordningsnummer = False
 
             if date_valid or 'TF' in cleaned_pnr:
                 # VALID DATE - proceed with Luhn check
@@ -957,6 +980,7 @@ def _find_personnummer_with_regex(
                     'luhn_valid': luhn_valid,
                     'date_valid': True,
                     'luhn_check_valid': luhn_valid,
+                    'is_samordningsnummer': is_samordningsnummer,
                     'extraction_type': 'normal',
                     'original_match': full_match,
                     'match_start': match.start(),
@@ -966,6 +990,11 @@ def _find_personnummer_with_regex(
                 if verbosity > 1:
                     if 'TF' in cleaned_pnr:
                         validity_str = "(TF number)"
+                    elif is_samordningsnummer:
+                        if not luhn_valid:
+                            validity_str = "(valid samordningsnummer date, invalid Luhn - will extract names)"
+                        else:
+                            validity_str = "(valid samordningsnummer)"
                     elif not luhn_valid:
                         validity_str = "(valid date, invalid Luhn - will extract names)"
                     else:
@@ -975,7 +1004,7 @@ def _find_personnummer_with_regex(
                 # INVALID DATE - completely reject
                 rejected_invalid_dates.append(cleaned_pnr)
                 if verbosity > 1:
-                    print(f"  REJECTED: {cleaned_pnr} (invalid date - no name extraction)", file=sys.stderr)
+                    print(f"  REJECTED: {cleaned_pnr} ({rejection_reason} - no name extraction)", file=sys.stderr)
 
     return results, rejected_invalid_dates
 
@@ -984,11 +1013,11 @@ def _find_personnummer_with_special_extraction(
     lines: List[str], 
     config: Config, 
     verbosity: int
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Find personnummer using special extraction for mangled OCR.
 
     Returns:
-        List of dictionaries with personnummer information
+        Tuple of (results, rejected_invalid_dates)
     """
     results = []
     rejected_invalid_dates = []
@@ -997,9 +1026,13 @@ def _find_personnummer_with_special_extraction(
         special_result = extract_special_personnummer(line, config, verbosity)
         if special_result:
             special_pnr, original_substring, start_pos, end_pos = special_result
-            date_valid = True
+
             if 'TF' not in special_pnr:
-                date_valid = validate_personnummer_date(special_pnr)
+                date_valid, rejection_reason, is_samordningsnummer = validate_personnummer_date(special_pnr, verbosity)
+            else:
+                date_valid = True
+                rejection_reason = None
+                is_samordningsnummer = False
 
             if date_valid or 'TF' in special_pnr:
                 luhn_valid = True
@@ -1013,6 +1046,7 @@ def _find_personnummer_with_special_extraction(
                     'luhn_valid': luhn_valid,
                     'date_valid': True,
                     'luhn_check_valid': luhn_valid,
+                    'is_samordningsnummer': is_samordningsnummer,
                     'extraction_type': 'special',
                     'original_match': original_substring,
                     'match_start': start_pos,
@@ -1020,14 +1054,17 @@ def _find_personnummer_with_special_extraction(
                 })
 
                 if verbosity > 1:
-                    validity_str = "(TF number)" if 'TF' in special_pnr else (
-                        "(valid date, invalid Luhn - will extract names)" if not luhn_valid else "(valid)"
-                    )
+                    if 'TF' in special_pnr:
+                        validity_str = "(TF number)"
+                    elif is_samordningsnummer:
+                        validity_str = "(valid samordningsnummer)" if luhn_valid else "(valid samordningsnummer date, invalid Luhn - will extract names)"
+                    else:
+                        validity_str = "(valid)" if luhn_valid else "(valid date, invalid Luhn - will extract names)"
                     print(f"  Found personnummer (special): {special_pnr} {validity_str}", file=sys.stderr)
             else:
                 rejected_invalid_dates.append(special_pnr)
                 if verbosity > 1:
-                    print(f"  REJECTED: {special_pnr} (special - invalid date, no name extraction)", file=sys.stderr)
+                    print(f"  REJECTED: {special_pnr} (special - {rejection_reason}, no name extraction)", file=sys.stderr)
 
     return results, rejected_invalid_dates
 
@@ -1263,8 +1300,16 @@ def extract_personnummer_and_names(text, page_num, config, verbosity, include_in
         selected_results = all_pnr_results
         # No selection needed - only one valid personnummer
         if verbosity > 1:
-            status = "valid" if all_pnr_results[0]['luhn_valid'] else "invalid Luhn"
-            print(f"  Using only valid personnummer: {all_pnr_results[0]['personnummer']} ({status})", file=sys.stderr)
+            pnr_info = all_pnr_results[0]
+            status_parts = []
+            if pnr_info['luhn_valid']:
+                status_parts.append("valid")
+            else:
+                status_parts.append("invalid Luhn")
+            if pnr_info.get('is_samordningsnummer'):
+                status_parts.append("samordningsnummer")
+            status = ", ".join(status_parts)
+            print(f"  Using only valid personnummer: {pnr_info['personnummer']} ({status})", file=sys.stderr)
 
     if not selected_results:
         return []
@@ -1290,7 +1335,8 @@ def extract_personnummer_and_names(text, page_num, config, verbosity, include_in
         'luhn_valid': selected['luhn_valid'],
         'original_pnr': selected['personnummer'],
         'date_valid': selected['date_valid'],
-        'luhn_check_valid': selected['luhn_check_valid']
+        'luhn_check_valid': selected['luhn_check_valid'],
+        'is_samordningsnummer': selected.get('is_samordningsnummer', False)
     }]
 
 def ocr_single_page(args):
@@ -1697,6 +1743,7 @@ def extract_all_data(page_texts, config, verbosity, include_invalid):
     all_data = []
     all_valid_entries = []  # For autocorrection lookup
     invalid_date_count = 0
+    samordningsnummer_count = 0
     last_captured_pnr = None  # Track last captured personnummer for proximity selection
 
     for page_num in sorted(page_texts.keys()):
@@ -1707,6 +1754,10 @@ def extract_all_data(page_texts, config, verbosity, include_invalid):
             # Count date validation failures
             if not result['date_valid'] and 'TF' not in result['personnummer']:
                 invalid_date_count += 1
+
+            # Count samordningsnummer
+            if result.get('is_samordningsnummer'):
+                samordningsnummer_count += 1
 
             # Collect valid entries for autocorrection (must pass both date and Luhn)
             if result['luhn_valid'] and result['efternamn'] and result['fornamn']:
@@ -1725,11 +1776,15 @@ def extract_all_data(page_texts, config, verbosity, include_invalid):
                 'original_pnr': result['original_pnr'],
                 'date_valid': result['date_valid'],
                 'luhn_check_valid': result['luhn_check_valid'],
+                'is_samordningsnummer': result.get('is_samordningsnummer', False),
                 'all_valid_entries': all_valid_entries  # Pass for autocorrection
             })
 
     if invalid_date_count > 0 and verbosity >= 0:
         print(f"  Found {invalid_date_count} personnummer with invalid date portions (likely organizational numbers)", file=sys.stderr)
+
+    if samordningsnummer_count > 0 and verbosity >= 0:
+        print(f"  Found {samordningsnummer_count} samordningsnummer (coordination numbers with day 61-91)", file=sys.stderr)
 
     return all_data
 
