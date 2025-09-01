@@ -264,7 +264,7 @@ def load_or_fetch_name_lists(use_scb_names=True, force_refresh=False, verbosity=
     return first_names, last_names
 
 def create_scb_names_dictionary(first_names_set, last_names_set, verbosity=0):
-    """Create a temporary dictionary file with all SCB names for ocrmypdf.
+    """Create a temporary dictionary file with all SCB names and common Swedish words for ocrmypdf.
 
     Returns:
         Path to the temporary dictionary file, or None if creation fails
@@ -283,17 +283,34 @@ def create_scb_names_dictionary(first_names_set, last_names_set, verbosity=0):
         # Only deduplicate if there's overlap between first/last names
         all_names = first_names_set | last_names_set
 
-        # Write to file (one word per line)
+        # Write names to file (one word per line)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             for name in sorted(all_names):
                 # Only include valid names (no spaces, reasonable length)
                 if name and ' ' not in name and len(name) <= 30:
                     f.write(name + '\n')
 
+            # Add common Swedish document words
+            swedish_words = [
+                'Personnr',
+                'Personnummer',
+                'Namn',
+                'Efternamn',
+                'Förnamn',
+                'Födelsedatum',
+                'Adress',
+                'Telefon',
+                'Datum',
+                'Underskrift'
+            ]
+
+            for word in swedish_words:
+                f.write(word + '\n')
+
         if verbosity > 0:
-            total_names = len(all_names)
-            print(f"  Created SCB names dictionary with {total_names:,} unique names "
-                  f"({len(first_names_set):,} first + {len(last_names_set):,} last) for OCR enhancement", 
+            total_names = len(all_names) + len(swedish_words)
+            print(f"  Created SCB names dictionary with {total_names:,} entries "
+                  f"({len(first_names_set):,} first + {len(last_names_set):,} last + {len(swedish_words)} document words) for OCR enhancement", 
                   file=sys.stderr)
 
         return dict_path
@@ -302,6 +319,21 @@ def create_scb_names_dictionary(first_names_set, last_names_set, verbosity=0):
         if verbosity >= 0:
             print(f"  Warning: Failed to create SCB names dictionary: {e}", file=sys.stderr)
         return None
+
+def count_words_for_cleaning(text):
+    """
+    Count words for cleaning logic where hyphens are considered word characters.
+    "Anna-Maria" = 1 word, "Anna Maria" = 2 words
+    """
+    if not text:
+        return 0
+
+    # Replace hyphens with a placeholder character that won't be split
+    text_modified = text.replace('-', '_')
+
+    # Split on spaces and count
+    words = text_modified.split()
+    return len(words)
 
 def create_personnummer_patterns_file(verbosity=0):
     """Create a temporary patterns file to help Tesseract recognize personnummer formats.
@@ -856,9 +888,14 @@ def format_personnummer(pnr):
     return str(century_year)[:2] + pnr_clean
 
 def clean_name_candidate(text, config, verbosity=0):
-    """Clean name candidate before parsing - remove stop words, punctuation, and edge words.
+    """Clean name candidate with new iterative cleaning logic.
 
-    This cleaning happens BEFORE splitting into fornamn/efternamn.
+    Rules:
+    - Only clean if > 2 words (hyphen counts as word character)
+    - One/two-letter words: can clean from both leading and trailing
+    - Three-letter words: can clean from trailing only
+    - Stop cleaning from an end when unclearable word is found
+    - Never clean SCB names or allowed words
     """
     if not text or not text.strip():
         return ""
@@ -866,127 +903,106 @@ def clean_name_candidate(text, config, verbosity=0):
     original_text = text
     text = text.strip()
 
-    # Step 1: Remove leading and trailing punctuation FIRST
-    # This ensures punctuation doesn't interfere with stop word detection
-    text = re.sub(r'^[^\w\s]+', '', text)  # Remove all punctuation at start
-    text = re.sub(r'[^\w\s]+$', '', text)   # Remove all punctuation at end (including periods)
+    # Get SCB names for checking
+    scb_names = set()
+    if config.use_scb_names:
+        scb_names = set(n.lower() for n in config.first_names_set) | set(n.lower() for n in config.last_names_set)
 
-    # Step 2: Remove stop words and everything before them
-    stop_patterns = [
-        r'(?i)\bEleven\b',           # Case-insensitive "Eleven"
-        r'(?i)\bintygas\s+att\b',    # "intygas att" with any spaces between
-        r'(?i)\bhar\b',              # Case-insensitive "har"
-    ]
+    # Allowed words that should NOT be cleaned
+    allowed_one_letter_words = {'i', 'å', 'ä', 'ö'}
 
-    for pattern in stop_patterns:
-        match = re.search(pattern, text)
-        if match:
-            # Remove the match and everything before it
-            text = text[match.end():].strip()
+    def can_clean_word(word, position):
+        """Check if a word can be cleaned based on all rules."""
+        word_lower = word.lower()
+        word_len = len(word)
+
+        # Never clean words 4+ letters
+        if word_len > 3:
+            return False
+
+        # Never clean SCB names
+        if word_lower in scb_names:
+            return False
+
+        # Never clean allowed one-letter words
+        if word_len == 1 and word_lower in allowed_one_letter_words:
+            return False
+
+        # Never clean allowed two-letter words
+        if word_len == 2 and word_lower in config.allowed_two_letter_words:
+            return False
+
+        # Three-letter words can only be cleaned from trailing position
+        if word_len == 3:
+            if position == 'leading':
+                return False
+            # Check if it's in allowed trailing three-letter words
+            if word_lower in config.allowed_trailing_three_letter_words:
+                return False
+
+        return True
+
+    # Iterative cleaning process
+    trailing_blocked = False
+    leading_blocked = False
+
+    while True:
+        # Check word count with hyphen as word character
+        if count_words_for_cleaning(text) <= 2:
             if verbosity > 1:
-                print(f"    Removed stop word and preceding text: '{original_text[:match.end()]}' → keeping '{text}'", 
-                      file=sys.stderr)
-
-    # Step 3: Clean internal punctuation (but keep hyphens and apostrophes for names)
-    # Remove commas, periods, etc. but keep name-relevant punctuation
-    text = re.sub(r'[,\.\;\:\!\?]', ' ', text)  # Replace punctuation with space
-    text = re.sub(r'\s+', ' ', text).strip()    # Normalize spaces
-
-    # Step 4: Split into words for edge cleaning
-    words = text.split()
-    if not words:
-        return ""
-
-    # Step 5: Clean leading one and two-letter words (with hyphen or space as separator)
-    while words:
-        first_word = words[0]
-        # Check for patterns like "A-" or "AB-" at the start of first word
-        if '-' in first_word:
-            parts = first_word.split('-', 1)
-            if len(parts[0]) <= 2:
-                # Check if it's a valid two-letter word
-                if len(parts[0]) == 2 and parts[0].lower() not in config.allowed_two_letter_words:
-                    words[0] = parts[1] if len(parts) > 1 and parts[1] else ""
-                    if not words[0]:
-                        words.pop(0)
-                    if verbosity > 1:
-                        print(f"    Removed leading fragment with hyphen: '{first_word}' → '{words[0] if words else ''}'", 
-                              file=sys.stderr)
-                    continue
-                elif len(parts[0]) == 1:
-                    words[0] = parts[1] if len(parts) > 1 and parts[1] else ""
-                    if not words[0]:
-                        words.pop(0)
-                    if verbosity > 1:
-                        print(f"    Removed leading single letter with hyphen: '{first_word}'", file=sys.stderr)
-                    continue
-
-        # Regular single/two-letter word cleaning
-        if len(first_word) == 1 and first_word.isalpha():
-            removed = words.pop(0)
-            if verbosity > 1:
-                print(f"    Removed leading single letter: '{removed}'", file=sys.stderr)
-        elif len(first_word) == 2 and first_word.lower() not in config.allowed_two_letter_words:
-            removed = words.pop(0)
-            if verbosity > 1:
-                print(f"    Removed leading two-letter word not in allowed list: '{removed}'", file=sys.stderr)
-        else:
+                print(f"    Stopping cleaning: only {count_words_for_cleaning(text)} words remaining", file=sys.stderr)
             break
 
-    # Step 6: Clean trailing one, two, and three-letter words (with allowed list for three-letter)
-    while words:
-        last_word = words[-1]
-        # Check for patterns with hyphen at the end
-        if '-' in last_word:
-            parts = last_word.rsplit('-', 1)
-            if len(parts[-1]) <= 3:
-                # Check validity for two-letter words
-                if len(parts[-1]) == 2 and parts[-1].lower() not in config.allowed_two_letter_words:
-                    words[-1] = parts[0] if len(parts) > 1 and parts[0] else ""
-                    if not words[-1]:
-                        words.pop()
-                    if verbosity > 1:
-                        print(f"    Removed trailing fragment with hyphen: '{last_word}' → '{words[-1] if words else ''}'", 
-                              file=sys.stderr)
-                    continue
-                elif len(parts[-1]) == 1:
-                    words[-1] = parts[0] if len(parts) > 1 and parts[0] else ""
-                    if not words[-1]:
-                        words.pop()
-                    if verbosity > 1:
-                        print(f"    Removed trailing single letter fragment: '{last_word}'", file=sys.stderr)
-                    continue
-                elif len(parts[-1]) == 3 and parts[-1].lower() not in config.allowed_trailing_three_letter_words:
-                    words[-1] = parts[0] if len(parts) > 1 and parts[0] else ""
-                    if not words[-1]:
-                        words.pop()
-                    if verbosity > 1:
-                        print(f"    Removed trailing three-letter fragment not in allowed list: '{last_word}'", file=sys.stderr)
-                    continue
-
-        # Regular word cleaning at the end
-        if len(last_word) == 1 and last_word.isalpha():
-            removed = words.pop()
+        # If both ends are blocked, stop
+        if trailing_blocked and leading_blocked:
             if verbosity > 1:
-                print(f"    Removed trailing single letter: '{removed}'", file=sys.stderr)
-        elif len(last_word) == 2 and last_word.lower() not in config.allowed_two_letter_words:
-            removed = words.pop()
-            if verbosity > 1:
-                print(f"    Removed trailing two-letter word not in allowed list: '{removed}'", file=sys.stderr)
-        elif len(last_word) == 3 and last_word.lower() not in config.allowed_trailing_three_letter_words:
-            # Only remove three-letter words that are NOT in the allowed list
-            removed = words.pop()
-            if verbosity > 1:
-                print(f"    Removed trailing three-letter word not in allowed list: '{removed}'", file=sys.stderr)
-        else:
+                print(f"    Stopping cleaning: both ends blocked", file=sys.stderr)
             break
 
-    cleaned = ' '.join(words)
+        cleaned_this_iteration = False
 
-    if verbosity > 1 and cleaned != original_text.strip():
-        print(f"    Name candidate cleaning: '{original_text}' → '{cleaned}'", file=sys.stderr)
+        # Try cleaning trailing word first
+        if not trailing_blocked:
+            words = text.split()
+            if words:
+                last_word = words[-1]
+                if can_clean_word(last_word, 'trailing'):
+                    text = ' '.join(words[:-1])
+                    cleaned_this_iteration = True
+                    if verbosity > 1:
+                        print(f"    Cleaned trailing '{last_word}' → '{text}'", file=sys.stderr)
+                else:
+                    trailing_blocked = True
+                    if verbosity > 1:
+                        print(f"    Cannot clean trailing '{last_word}' - blocking trailing", file=sys.stderr)
 
-    return cleaned
+        # Check word count again
+        if count_words_for_cleaning(text) <= 2:
+            break
+
+        # Try cleaning leading word
+        if not leading_blocked:
+            words = text.split()
+            if words:
+                first_word = words[0]
+                if can_clean_word(first_word, 'leading'):
+                    text = ' '.join(words[1:])
+                    cleaned_this_iteration = True
+                    if verbosity > 1:
+                        print(f"    Cleaned leading '{first_word}' → '{text}'", file=sys.stderr)
+                else:
+                    leading_blocked = True
+                    if verbosity > 1:
+                        print(f"    Cannot clean leading '{first_word}' - blocking leading", file=sys.stderr)
+
+        # If nothing was cleaned in this iteration, stop
+        if not cleaned_this_iteration:
+            break
+
+    if verbosity > 1 and text != original_text:
+        print(f"    Final cleaning result: '{original_text}' → '{text}'", file=sys.stderr)
+
+    return text.strip()
 
 
 def personnummer_sort_key(pnr):
@@ -1029,18 +1045,36 @@ def personnummer_sort_key(pnr):
 
 
 def parse_name_from_text(text, config, verbosity=0):
-    """Parse efternamn and förnamn from text, handling both comma-separated and space-separated formats.
+    """Parse efternamn and förnamn from text, handling comma cleaning and splitting.
 
-    Now includes pre-cleaning to remove stop words and edge punctuation/single letters.
+    Process:
+    1. Apply word cleaning
+    2. Handle commas (keep rightmost if multiple)
+    3. Split on comma or space
     """
     if not text or not text.strip():
         return None, None
 
-    # Apply the new cleaning BEFORE any parsing
+    # Apply the new cleaning FIRST
     text = clean_name_candidate(text, config, verbosity)
 
     if not text:
         return None, None
+
+    # Remove leading/trailing commas
+    text = text.strip(',').strip()
+
+    # Handle multiple internal commas - keep only the rightmost one
+    comma_count = text.count(',')
+    if comma_count > 1:
+        if verbosity > 1:
+            print(f"    Found {comma_count} commas, keeping only rightmost", file=sys.stderr)
+        # Find the rightmost comma and remove all others
+        parts = text.split(',')
+        # Keep only the last comma by joining all but last with space, then add comma before last
+        text = ' '.join(parts[:-1]) + ',' + parts[-1]
+        if verbosity > 1:
+            print(f"    After comma cleaning: '{text}'", file=sys.stderr)
 
     # Check if comma-separated format
     if ',' in text:
@@ -1089,8 +1123,7 @@ def parse_name_from_text(text, config, verbosity=0):
         return None, None
 
     else:
-        # Space-separated format
-        # Clean the text first to remove unwanted characters including digits
+        # Space-separated format - use heuristic splitting
         cleaned_text = clean_name(text, config)
 
         if not cleaned_text:
@@ -1105,8 +1138,25 @@ def parse_name_from_text(text, config, verbosity=0):
             processed_words = merge_short_words_with_nearest_shortest(words, config, verbosity)
 
             if len(processed_words) >= 2:
-                fornamn = processed_words[-1]  # Last word
-                efternamn = ' '.join(processed_words[:-1])  # All preceding words
+                # Heuristic: typically "Förnamn Efternamn" in Swedish
+                # But check against SCB lists if available
+                if config.use_scb_names and (config.first_names_set or config.last_names_set):
+                    # Check if last word is a known surname
+                    if processed_words[-1] in config.last_names_set:
+                        efternamn = processed_words[-1]
+                        fornamn = ' '.join(processed_words[:-1])
+                    # Check if first word is a known first name
+                    elif processed_words[0] in config.first_names_set:
+                        fornamn = processed_words[0]
+                        efternamn = ' '.join(processed_words[1:])
+                    else:
+                        # Default: assume last word is surname
+                        efternamn = processed_words[-1]
+                        fornamn = ' '.join(processed_words[:-1])
+                else:
+                    # No SCB lists, use default heuristic
+                    efternamn = processed_words[-1]
+                    fornamn = ' '.join(processed_words[:-1])
 
                 if verbosity > 1:
                     if processed_words != words:
@@ -1123,6 +1173,15 @@ def parse_name_from_text(text, config, verbosity=0):
                     print(f"    Name processing (space-separated): '{text}' → only one word after processing: '{processed_words[0]}'", 
                           file=sys.stderr)
                 return None, None
+        elif len(words) == 1:
+            # Only one word - check if it's a known name
+            word = words[0]
+            if config.use_scb_names:
+                if word in config.first_names_set:
+                    return "", word
+                elif word in config.last_names_set:
+                    return word, ""
+            return None, None
         return None, None
 
 def _process_inheritance_with_hole_filling(
