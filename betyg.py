@@ -828,12 +828,113 @@ def format_personnummer(pnr):
 
     return str(century_year)[:2] + pnr_clean
 
+def clean_name_candidate(text, config, verbosity=0):
+    """Clean name candidate before parsing - remove stop words, punctuation, and edge single letters.
+
+    This cleaning happens BEFORE splitting into fornamn/efternamn.
+    """
+    if not text or not text.strip():
+        return ""
+
+    original_text = text
+    text = text.strip()
+
+    # Step 1: Remove stop words and everything before them
+    stop_patterns = [
+        r'(?i)\bEleven\b',  # Case-insensitive "Eleven"
+        r'(?i)\bintygas\s+att\b',  # "intygas att" with any spaces between
+    ]
+
+    for pattern in stop_patterns:
+        match = re.search(pattern, text)
+        if match:
+            # Remove the match and everything before it
+            text = text[match.end():].strip()
+            if verbosity > 1:
+                print(f"    Removed stop word and preceding text: '{original_text[:match.end()]}' → keeping '{text}'", 
+                      file=sys.stderr)
+
+    # Step 2: Clean leading and trailing punctuation (but keep internal punctuation like comma)
+    # Remove all punctuation at the start
+    text = re.sub(r'^[^\w\s]+', '', text)
+    # Remove all punctuation at the end (except period for Jr. Sr. etc)
+    text = re.sub(r'[^\w\s.]+$', '', text)
+
+    # Step 3: Remove single-letter words at edges (before merging)
+    words = text.split()
+    if words:
+        # Remove single letters from the beginning
+        while words and len(words[0]) == 1 and words[0].isalpha():
+            removed = words.pop(0)
+            if verbosity > 1:
+                print(f"    Removed leading single letter: '{removed}'", file=sys.stderr)
+
+        # Remove single letters from the end
+        while words and len(words[-1]) == 1 and words[-1].isalpha():
+            removed = words.pop()
+            if verbosity > 1:
+                print(f"    Removed trailing single letter: '{removed}'", file=sys.stderr)
+
+    cleaned = ' '.join(words)
+
+    if verbosity > 1 and cleaned != original_text.strip():
+        print(f"    Name candidate cleaning: '{original_text}' → '{cleaned}'", file=sys.stderr)
+
+    return cleaned
+
+
+def personnummer_sort_key(pnr):
+    """Generate sort key for personnummer using 95-year rule.
+
+    Returns a tuple that sorts correctly:
+    - Century (20xx before 19xx for same YY)
+    - Full personnummer for final ordering
+    """
+    if not pnr:
+        return (9999, "")  # Empty sorts last
+
+    # Remove hyphen for processing
+    clean_pnr = pnr.replace('-', '')
+
+    # Extract year (first 2 digits)
+    try:
+        year_part = int(clean_pnr[:2])
+    except (ValueError, IndexError):
+        return (9999, pnr)  # Invalid format sorts last
+
+    current_year = datetime.now().year
+    current_century_year = current_year % 100
+
+    # Apply 95-year rule
+    if year_part <= current_century_year:
+        # Could be 2000s
+        century_year = 2000 + year_part
+    else:
+        # Must be 1900s
+        century_year = 1900 + year_part
+
+    # Check if age would be > 95
+    age = current_year - century_year
+    if age > 95:
+        century_year += 100
+
+    # Return sort key: (century_year, full_pnr_as_string)
+    return (century_year, clean_pnr)
+
+
 def parse_name_from_text(text, config, verbosity=0):
-    """Parse efternamn and förnamn from text, handling both comma-separated and space-separated formats."""
+    """Parse efternamn and förnamn from text, handling both comma-separated and space-separated formats.
+
+    Now includes pre-cleaning to remove stop words and edge punctuation/single letters.
+    """
     if not text or not text.strip():
         return None, None
 
-    text = text.strip()
+    # Apply the new cleaning BEFORE any parsing
+    text = clean_name_candidate(text, config, verbosity)
+
+    if not text:
+        return None, None
 
     # Check if comma-separated format
     if ',' in text:
@@ -845,6 +946,9 @@ def parse_name_from_text(text, config, verbosity=0):
             # Apply short word merging separately to each part
             efternamn_words = efternamn_raw.split() if efternamn_raw else []
             fornamn_words = fornamn_raw.split() if fornamn_raw else []
+
+            if verbosity > 1 and (efternamn_words or fornamn_words):
+                print(f"    Word merging phase (after cleaning):", file=sys.stderr)
 
             # Process each part separately
             processed_efternamn_words = merge_short_words_with_nearest_shortest(efternamn_words, config, verbosity)
@@ -888,6 +992,9 @@ def parse_name_from_text(text, config, verbosity=0):
 
         words = cleaned_text.split()
         if len(words) >= 2:
+            if verbosity > 1:
+                print(f"    Word merging phase (after cleaning):", file=sys.stderr)
+
             # Process short words by merging them with nearest shortest words
             processed_words = merge_short_words_with_nearest_shortest(words, config, verbosity)
 
@@ -911,6 +1018,166 @@ def parse_name_from_text(text, config, verbosity=0):
                           file=sys.stderr)
                 return None, None
         return None, None
+
+def _process_inheritance_with_hole_filling(
+    current_page_entries: Dict[int, List[Dict]], 
+    total_pages: int, 
+    inherit: bool,
+    disable_hole_filling: bool,
+    verbosity: int
+) -> Tuple[List[Dict], Dict[str, List], int, int]:
+    """Process inheritance logic with hole-filling for identical surrounding personnummer.
+
+    New feature: If pages without personnummer are surrounded by pages with identical 
+    personnummer, fill the hole with that personnummer.
+    """
+    final_data = []
+    pnr_to_names = defaultdict(list)
+    last_valid_entry = None
+    pages_with_pnr = 0
+    pages_without_pnr = 0
+
+    # First pass: collect all page data and identify holes
+    page_data = {}
+    for page_num in range(1, total_pages + 1):
+        if page_num in current_page_entries:
+            page_entries = current_page_entries[page_num]
+            if len(page_entries) != 1:
+                raise RuntimeError(f"Internal error: Expected exactly 1 entry for page {page_num}, got {len(page_entries)}")
+
+            entry = page_entries[0]
+            page_data[page_num] = entry
+
+            if entry['personnummer']:
+                pages_with_pnr += 1
+            else:
+                pages_without_pnr += 1
+        else:
+            page_data[page_num] = None
+            pages_without_pnr += 1
+
+    # Second pass: apply inheritance and hole-filling
+    for page_num in range(1, total_pages + 1):
+        entry = page_data.get(page_num)
+
+        if entry and entry['personnummer']:
+            # Page has personnummer - use it
+            pnr = entry['personnummer']
+
+            # Track name combinations
+            name_combo = (entry['efternamn'], entry['fornamn'])
+            if name_combo != ("", ""):
+                pnr_to_names[pnr].append(name_combo)
+
+            # Add to final data
+            final_data.append({
+                'page': page_num,
+                'personnummer': pnr,
+                'efternamn': entry['efternamn'],
+                'fornamn': entry['fornamn'],
+                'luhn_valid': entry['luhn_valid'],
+                'was_corrected': entry.get('was_corrected', False)
+            })
+
+            # Update last valid entry for regular inheritance
+            last_valid_entry = {
+                'personnummer': pnr,
+                'efternamn': entry['efternamn'],
+                'fornamn': entry['fornamn']
+            }
+        else:
+            # No personnummer on this page - check for hole-filling opportunity
+            filled = False
+
+            if not disable_hole_filling:
+                # Look for identical personnummer before and after this hole
+                # Find the start and end of the current hole
+                hole_start = page_num
+                hole_end = page_num
+
+                # Find consecutive pages without personnummer
+                while hole_end < total_pages:
+                    next_entry = page_data.get(hole_end + 1)
+                    if next_entry and next_entry['personnummer']:
+                        break
+                    hole_end += 1
+
+                # Find personnummer before the hole
+                pnr_before = None
+                for p in range(hole_start - 1, 0, -1):
+                    prev_entry = page_data.get(p)
+                    if prev_entry and prev_entry['personnummer']:
+                        pnr_before = prev_entry['personnummer']
+                        break
+
+                # Find personnummer after the hole
+                pnr_after = None
+                for p in range(hole_end + 1, total_pages + 1):
+                    next_entry = page_data.get(p)
+                    if next_entry and next_entry['personnummer']:
+                        pnr_after = next_entry['personnummer']
+                        break
+
+                # Check if we should fill the hole
+                if pnr_before and pnr_after and pnr_before == pnr_after:
+                    # Fill with the identical surrounding personnummer
+                    if verbosity > 1:
+                        if hole_start == hole_end:
+                            print(f"--- Page {page_num} ---", file=sys.stderr)
+                            print(f"  Hole-filling: No personnummer found, but surrounded by identical {pnr_before} - filling hole", 
+                                  file=sys.stderr)
+                        else:
+                            print(f"--- Pages {hole_start}-{hole_end} ---", file=sys.stderr)
+                            print(f"  Hole-filling: No personnummer found on {hole_end - hole_start + 1} consecutive pages, "
+                                  f"but surrounded by identical {pnr_before} - filling hole", file=sys.stderr)
+
+                    # Use the names from the surrounding entry (prefer the one before)
+                    prev_entry = page_data.get(hole_start - 1)
+                    if prev_entry:
+                        final_data.append({
+                            'page': page_num,
+                            'personnummer': pnr_before,
+                            'efternamn': prev_entry['efternamn'],
+                            'fornamn': prev_entry['fornamn'],
+                            'luhn_valid': True,
+                            'was_corrected': False,
+                            'hole_filled': True
+                        })
+                        filled = True
+
+            # If not filled by hole-filling, use regular inheritance
+            if not filled:
+                if inherit and last_valid_entry:
+                    if verbosity > 1:
+                        print(f"--- Page {page_num} ---", file=sys.stderr)
+                        print(f"  No personnummer found, inheriting {last_valid_entry['personnummer']} "
+                              f"({last_valid_entry['efternamn']}, {last_valid_entry['fornamn']})", 
+                              file=sys.stderr)
+                    final_data.append({
+                        'page': page_num,
+                        'personnummer': last_valid_entry['personnummer'],
+                        'efternamn': last_valid_entry['efternamn'],
+                        'fornamn': last_valid_entry['fornamn'],
+                        'luhn_valid': True,
+                        'was_corrected': False
+                    })
+                else:
+                    if verbosity > 1:
+                        print(f"--- Page {page_num} ---", file=sys.stderr)
+                        if not inherit:
+                            print(f"  No personnummer found, inheritance disabled - empty row", file=sys.stderr)
+                        else:
+                            print(f"  No personnummer found, no previous entry to inherit - empty row", file=sys.stderr)
+                    final_data.append({
+                        'page': page_num,
+                        'personnummer': "",
+                        'efternamn': "",
+                        'fornamn': "",
+                        'luhn_valid': False,
+                        'was_corrected': False
+                    })
+
+    return final_data, pnr_to_names, pages_with_pnr, pages_without_pnr
 
 def should_filter_line(line, config):
     """Check if a line should be filtered out when searching for names."""
@@ -1910,8 +2177,11 @@ def check_required_commands(verbosity=0):
     return True
 
 def report_names_not_in_lists(final_data, config, verbosity):
-    """Report personnummer with names not found in the SCB name lists."""
-    if not config.use_scb_names or verbosity < 0:  # RENAMED from use_json_names
+    """Report personnummer with names not found in the SCB name lists.
+
+    Now sorts using the 95-year rule like other personnummer lists.
+    """
+    if not config.use_scb_names or verbosity < 0:
         return
 
     # Collect entries with names not in lists
@@ -1952,7 +2222,10 @@ def report_names_not_in_lists(final_data, config, verbosity):
             if pnr not in by_pnr:
                 by_pnr[pnr] = item
 
-        for pnr, item in sorted(by_pnr.items()):
+        # Sort using the 95-year rule
+        sorted_items = sorted(by_pnr.items(), key=lambda x: personnummer_sort_key(x[0]))
+
+        for pnr, item in sorted_items:
             issues = []
             if item['fornamn_not_in_list']:
                 issues.append(f"förnamn '{item['fornamn']}' not in list")
@@ -1964,7 +2237,7 @@ def report_names_not_in_lists(final_data, config, verbosity):
 
 
 def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, inherit=True, 
-                autocorrect=True, use_scb_names=True, use_pnr_patterns=True):  # NEW parameter
+                autocorrect=True, use_scb_names=True, use_pnr_patterns=True, disable_hole_filling=False):  # NEW parameter
     """Process PDF file with OCR and extract data."""
     # Validate inputs and environment
     if not validate_input_file(pdf_path, verbosity):
@@ -1976,7 +2249,7 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
     # Create configuration instance
     config = Config()
     config.use_scb_names = use_scb_names
-    config.use_pnr_patterns = use_pnr_patterns  # NEW
+    config.use_pnr_patterns = use_pnr_patterns
 
     # Load name lists if enabled
     if use_scb_names:
@@ -2002,6 +2275,11 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
             print("  Inheritance: DISABLED - pages without personnummer will have empty field", file=sys.stderr)
         else:
             print("  Inheritance: ENABLED - pages without personnummer inherit from previous", file=sys.stderr)
+
+        if disable_hole_filling:
+            print("  Hole-filling: DISABLED - holes won't be filled even with identical surrounding IDs", file=sys.stderr)
+        else:
+            print("  Hole-filling: ENABLED - holes filled when surrounded by identical personnummer", file=sys.stderr)
 
         if use_scb_names:
             if config.first_names_set or config.last_names_set:
@@ -2029,7 +2307,9 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
             if autocorrect:
                 raw_data = apply_autocorrection(raw_data, verbosity)
 
-            final_data = apply_inheritance_and_resolve_names(raw_data, total_pages, inherit, config, verbosity, include_invalid)
+            final_data = apply_inheritance_and_resolve_names(
+                raw_data, total_pages, inherit, config, verbosity, include_invalid, disable_hole_filling
+            )
 
             # Report names not in lists if SCB names enabled
             if use_scb_names:
@@ -2489,15 +2769,13 @@ def validate_autocorrection_requirements(invalid_pnr, efternamn, fornamn):
 def apply_inheritance_and_resolve_names(
     raw_data: List[Dict], 
     total_pages: int, 
-    inherit: bool, 
+    inherit: bool,
     config: Config, 
     verbosity: int, 
-    include_invalid: bool
+    include_invalid: bool,
+    disable_hole_filling: bool = False  # New parameter
 ) -> List[Dict[str, Any]]:
-    """Apply inheritance and resolve name variants to produce final data.
-
-    This function has been significantly simplified by delegating to helper functions.
-    """
+    """Apply inheritance (with hole-filling) and resolve name variants to produce final data."""
     # Process invalid personnummer first
     invalid_pnr_count = 0
     for entry in raw_data:
@@ -2514,14 +2792,17 @@ def apply_inheritance_and_resolve_names(
     for entry in raw_data:
         current_page_entries[entry['page']].append(entry)
 
-    # Step 1: Process inheritance
-    final_data, pnr_to_names, pages_with_pnr, pages_without_pnr = _process_inheritance(
-        current_page_entries, total_pages, inherit, verbosity
+    # Step 1: Process inheritance with hole-filling
+    final_data, pnr_to_names, pages_with_pnr, pages_without_pnr = _process_inheritance_with_hole_filling(
+        current_page_entries, total_pages, inherit, disable_hole_filling, verbosity
     )
 
     # Log inheritance statistics
     if verbosity >= 0:
         print(f"  Found personnummer on {pages_with_pnr} pages", file=sys.stderr)
+        hole_filled_count = sum(1 for e in final_data if e.get('hole_filled', False))
+        if hole_filled_count > 0:
+            print(f"  Hole-filled {hole_filled_count} pages with identical surrounding personnummer", file=sys.stderr)
         if pages_without_pnr > 0:
             if inherit:
                 print(f"  {pages_without_pnr} pages inherited personnummer or had empty fields", file=sys.stderr)
@@ -2566,7 +2847,6 @@ def apply_inheritance_and_resolve_names(
 
     return final_data
 
-
 def main():
     parser = argparse.ArgumentParser(
         description='OCR PDF and extract Swedish personal numbers',
@@ -2588,8 +2868,10 @@ def main():
                         help='Disable automatic correction of single-digit OCR errors')
     parser.add_argument('--no-scb-names', action='store_true',
                         help='Disable using SCB Swedish name lists for OCR enhancement and validation')
-    parser.add_argument('--no-pnr-patterns', action='store_true',  # NEW
+    parser.add_argument('--no-pnr-patterns', action='store_true',
                         help='Disable personnummer pattern hints for OCR (may reduce ID number recognition)')
+    parser.add_argument('--no-hole-filling', action='store_true',  # NEW
+                        help='Disable hole-filling when pages are surrounded by identical personnummer')
 
     args = parser.parse_args()
 
@@ -2617,7 +2899,8 @@ def main():
     # Process the PDF
     data = process_pdf(args.pdf_file, verbosity, args.jobs, args.include_invalid, 
                       not args.no_inheritance, not args.no_autocorrect, 
-                      not args.no_scb_names, not args.no_pnr_patterns)  # NEW parameter
+                      not args.no_scb_names, not args.no_pnr_patterns,
+                      args.no_hole_filling)  # NEW parameter
 
     # Output CSV
     csv_writer = csv.writer(sys.stdout)
