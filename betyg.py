@@ -74,15 +74,31 @@ class Config:
         'ni', 'ua'
     })
 
+    # NEW: Allowed three-letter words at the end (common name endings)
+    allowed_trailing_three_letter_words: set = dataclasses.field(default_factory=lambda: {
+        'son',  # Most common Swedish surname ending (Andersson, Johansson, etc.)
+        'sen',  # Danish/Norwegian variant (Hansen, Jensen, etc.)
+        'zon',  # Less common variant
+        'zen',  # Less common variant
+        'dotter', # Though this is longer, including for completeness
+        'nen',  # Finnish surname ending (Virtanen, etc.)
+        'ven',  # Some names end with this
+        'man',  # Common ending (Bergman, etc.)
+        'din',  # Some names end with this
+        'ius',  # Latin-origin names
+        'ell',  # Names like Kjell
+        'olf',  # Names like Rolf
+    })
+
     # Scoring weights
     scandinavian_bonus: int = 1000
     all_caps_penalty: int = 50
     excessive_length_threshold: int = 15
     excessive_length_penalty: int = 100
 
-    # Name list matching bonuses
-    first_name_match_bonus: int = 500
-    last_name_match_bonus: int = 500
+    # Name list matching bonuses (UPDATED: Higher than Scandinavian bonus)
+    first_name_match_bonus: int = 2000  # Increased from 500
+    last_name_match_bonus: int = 2000   # Increased from 500
 
     # Filter keywords
     filter_keywords: list = dataclasses.field(default_factory=lambda: 
@@ -343,9 +359,9 @@ def create_personnummer_patterns_file(verbosity=0):
 
 
 def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, verbosity=0):
-    """Check if names should be swapped based on name list membership.
+    """Check if names should be swapped based on name list membership and 'son' ending.
 
-    Will NOT swap if both names appear in both lists (both arrangements valid).
+    Will NOT swap if both names appear in both lists UNLESS efternamn ends with 'son'.
     """
     if not efternamn or not fornamn:
         return efternamn, fornamn, False
@@ -356,8 +372,20 @@ def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, ve
     efternamn_in_first = efternamn in first_names_set
     efternamn_in_last = efternamn in last_names_set
 
-    # Check if BOTH names appear in BOTH lists
-    # If so, both arrangements are valid - don't swap
+    # NEW: Check for "son" ending bias
+    fornamn_ends_with_son = fornamn.lower().endswith('son')
+
+    # If fornamn ends with "son" and both names are valid in both lists,
+    # we should swap because "son" is a strong indicator of a last name
+    if fornamn_ends_with_son and (fornamn_in_first and fornamn_in_last and 
+                                   efternamn_in_first and efternamn_in_last):
+        if verbosity > 1:
+            print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
+                  f"(fornamn ends with 'son' - strong last name indicator)", file=sys.stderr)
+        return fornamn, efternamn, True
+
+    # Original check: if BOTH names appear in BOTH lists, don't swap
+    # (unless overridden by 'son' ending above)
     if (fornamn_in_first and fornamn_in_last and 
         efternamn_in_first and efternamn_in_last):
         if verbosity > 1:
@@ -593,8 +621,7 @@ def merge_short_words_with_nearest_shortest(words, config, verbosity=0):
     return words_copy
 
 def select_best_name_variant(name_counter, pnr, config, verbosity):
-    """Select the best name variant with bias towards Scandinavian characters, against ALL CAPS, 
-    against excessive length, and towards names in SCB lists."""
+    """Select the best name variant with bias towards SCB list matches over Scandinavian characters."""
     if len(name_counter) == 1:
         return list(name_counter.keys())[0]
 
@@ -619,9 +646,23 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
         # Base score from occurrence count
         score = count
 
-        # Scandinavian character bonus (heavily weighted)
+        # SCB name list matching bonuses - HIGHER priority than Scandinavian
+        if config.use_scb_names:
+            if fornamn in config.first_names_set:
+                score += config.first_name_match_bonus  # Now 2000
+                if verbosity > 1:
+                    print(f"    SCB name bonus: '{fornamn}' found in first names (+{config.first_name_match_bonus})", 
+                          file=sys.stderr)
+
+            if efternamn in config.last_names_set:
+                score += config.last_name_match_bonus  # Now 2000
+                if verbosity > 1:
+                    print(f"    SCB name bonus: '{efternamn}' found in last names (+{config.last_name_match_bonus})", 
+                          file=sys.stderr)
+
+        # Scandinavian character bonus (now lower priority than SCB lists)
         scand_count = count_scandinavian_chars(full_name)
-        score += scand_count * config.scandinavian_bonus
+        score += scand_count * config.scandinavian_bonus  # 1000 per character
 
         # ALL CAPS penalty
         if is_all_caps(efternamn) or is_all_caps(fornamn):
@@ -632,20 +673,6 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
             score -= config.excessive_length_penalty
         if len(fornamn) > config.excessive_length_threshold:
             score -= config.excessive_length_penalty
-
-        # Name list matching bonuses (if SCB names enabled)
-        if config.use_scb_names:  # RENAMED from use_json_names
-            if fornamn in config.first_names_set:
-                score += config.first_name_match_bonus
-                if verbosity > 1:
-                    print(f"    SCB name bonus: '{fornamn}' found in first names (+{config.first_name_match_bonus})", 
-                          file=sys.stderr)
-
-            if efternamn in config.last_names_set:
-                score += config.last_name_match_bonus
-                if verbosity > 1:
-                    print(f"    SCB name bonus: '{efternamn}' found in last names (+{config.last_name_match_bonus})", 
-                          file=sys.stderr)
 
         scored_variants.append((name, count, score))
 
@@ -829,7 +856,7 @@ def format_personnummer(pnr):
     return str(century_year)[:2] + pnr_clean
 
 def clean_name_candidate(text, config, verbosity=0):
-    """Clean name candidate before parsing - remove stop words, punctuation, and edge single letters.
+    """Clean name candidate before parsing - remove stop words, punctuation, and edge words.
 
     This cleaning happens BEFORE splitting into fornamn/efternamn.
     """
@@ -839,10 +866,16 @@ def clean_name_candidate(text, config, verbosity=0):
     original_text = text
     text = text.strip()
 
-    # Step 1: Remove stop words and everything before them
+    # Step 1: Remove leading and trailing punctuation FIRST
+    # This ensures punctuation doesn't interfere with stop word detection
+    text = re.sub(r'^[^\w\s]+', '', text)  # Remove all punctuation at start
+    text = re.sub(r'[^\w\s]+$', '', text)   # Remove all punctuation at end (including periods)
+
+    # Step 2: Remove stop words and everything before them
     stop_patterns = [
-        r'(?i)\bEleven\b',  # Case-insensitive "Eleven"
-        r'(?i)\bintygas\s+att\b',  # "intygas att" with any spaces between
+        r'(?i)\bEleven\b',           # Case-insensitive "Eleven"
+        r'(?i)\bintygas\s+att\b',    # "intygas att" with any spaces between
+        r'(?i)\bhar\b',              # Case-insensitive "har"
     ]
 
     for pattern in stop_patterns:
@@ -854,26 +887,99 @@ def clean_name_candidate(text, config, verbosity=0):
                 print(f"    Removed stop word and preceding text: '{original_text[:match.end()]}' → keeping '{text}'", 
                       file=sys.stderr)
 
-    # Step 2: Clean leading and trailing punctuation (but keep internal punctuation like comma)
-    # Remove all punctuation at the start
-    text = re.sub(r'^[^\w\s]+', '', text)
-    # Remove all punctuation at the end (except period for Jr. Sr. etc)
-    text = re.sub(r'[^\w\s.]+$', '', text)
+    # Step 3: Clean internal punctuation (but keep hyphens and apostrophes for names)
+    # Remove commas, periods, etc. but keep name-relevant punctuation
+    text = re.sub(r'[,\.\;\:\!\?]', ' ', text)  # Replace punctuation with space
+    text = re.sub(r'\s+', ' ', text).strip()    # Normalize spaces
 
-    # Step 3: Remove single-letter words at edges (before merging)
+    # Step 4: Split into words for edge cleaning
     words = text.split()
-    if words:
-        # Remove single letters from the beginning
-        while words and len(words[0]) == 1 and words[0].isalpha():
+    if not words:
+        return ""
+
+    # Step 5: Clean leading one and two-letter words (with hyphen or space as separator)
+    while words:
+        first_word = words[0]
+        # Check for patterns like "A-" or "AB-" at the start of first word
+        if '-' in first_word:
+            parts = first_word.split('-', 1)
+            if len(parts[0]) <= 2:
+                # Check if it's a valid two-letter word
+                if len(parts[0]) == 2 and parts[0].lower() not in config.allowed_two_letter_words:
+                    words[0] = parts[1] if len(parts) > 1 and parts[1] else ""
+                    if not words[0]:
+                        words.pop(0)
+                    if verbosity > 1:
+                        print(f"    Removed leading fragment with hyphen: '{first_word}' → '{words[0] if words else ''}'", 
+                              file=sys.stderr)
+                    continue
+                elif len(parts[0]) == 1:
+                    words[0] = parts[1] if len(parts) > 1 and parts[1] else ""
+                    if not words[0]:
+                        words.pop(0)
+                    if verbosity > 1:
+                        print(f"    Removed leading single letter with hyphen: '{first_word}'", file=sys.stderr)
+                    continue
+
+        # Regular single/two-letter word cleaning
+        if len(first_word) == 1 and first_word.isalpha():
             removed = words.pop(0)
             if verbosity > 1:
                 print(f"    Removed leading single letter: '{removed}'", file=sys.stderr)
+        elif len(first_word) == 2 and first_word.lower() not in config.allowed_two_letter_words:
+            removed = words.pop(0)
+            if verbosity > 1:
+                print(f"    Removed leading two-letter word not in allowed list: '{removed}'", file=sys.stderr)
+        else:
+            break
 
-        # Remove single letters from the end
-        while words and len(words[-1]) == 1 and words[-1].isalpha():
+    # Step 6: Clean trailing one, two, and three-letter words (with allowed list for three-letter)
+    while words:
+        last_word = words[-1]
+        # Check for patterns with hyphen at the end
+        if '-' in last_word:
+            parts = last_word.rsplit('-', 1)
+            if len(parts[-1]) <= 3:
+                # Check validity for two-letter words
+                if len(parts[-1]) == 2 and parts[-1].lower() not in config.allowed_two_letter_words:
+                    words[-1] = parts[0] if len(parts) > 1 and parts[0] else ""
+                    if not words[-1]:
+                        words.pop()
+                    if verbosity > 1:
+                        print(f"    Removed trailing fragment with hyphen: '{last_word}' → '{words[-1] if words else ''}'", 
+                              file=sys.stderr)
+                    continue
+                elif len(parts[-1]) == 1:
+                    words[-1] = parts[0] if len(parts) > 1 and parts[0] else ""
+                    if not words[-1]:
+                        words.pop()
+                    if verbosity > 1:
+                        print(f"    Removed trailing single letter fragment: '{last_word}'", file=sys.stderr)
+                    continue
+                elif len(parts[-1]) == 3 and parts[-1].lower() not in config.allowed_trailing_three_letter_words:
+                    words[-1] = parts[0] if len(parts) > 1 and parts[0] else ""
+                    if not words[-1]:
+                        words.pop()
+                    if verbosity > 1:
+                        print(f"    Removed trailing three-letter fragment not in allowed list: '{last_word}'", file=sys.stderr)
+                    continue
+
+        # Regular word cleaning at the end
+        if len(last_word) == 1 and last_word.isalpha():
             removed = words.pop()
             if verbosity > 1:
                 print(f"    Removed trailing single letter: '{removed}'", file=sys.stderr)
+        elif len(last_word) == 2 and last_word.lower() not in config.allowed_two_letter_words:
+            removed = words.pop()
+            if verbosity > 1:
+                print(f"    Removed trailing two-letter word not in allowed list: '{removed}'", file=sys.stderr)
+        elif len(last_word) == 3 and last_word.lower() not in config.allowed_trailing_three_letter_words:
+            # Only remove three-letter words that are NOT in the allowed list
+            removed = words.pop()
+            if verbosity > 1:
+                print(f"    Removed trailing three-letter word not in allowed list: '{removed}'", file=sys.stderr)
+        else:
+            break
 
     cleaned = ' '.join(words)
 
@@ -1970,40 +2076,57 @@ def extract_names_for_personnummer(
 
 
 def extract_personnummer_and_names(text, page_num, config, verbosity, include_invalid=False, last_captured_pnr=None):
-    """Extract personnummer and names - select ONE personnummer first, then extract names."""
+    """Extract personnummer and names - handling late vs early rejection for name keeping."""
 
-    # Step 1: Find ALL valid personnummer on page (invalid dates already filtered out)
+    # Step 1: Find ALL personnummer on page (both valid and invalid)
     all_pnr_results = find_all_personnummer_on_page(text, page_num, config, verbosity)
 
     if not all_pnr_results:
         if verbosity > 1:
-            print(f"  No valid personnummer found on this page", file=sys.stderr)
+            print(f"  No personnummer found on this page", file=sys.stderr)
         return []
 
-    # Step 2: Select ONE personnummer (only if multiple valid options exist)
-    if len(all_pnr_results) > 1:
-        selected_results = select_closest_personnummer(all_pnr_results, page_num, last_captured_pnr, verbosity)
+    # Step 2: Filter out early rejections (these won't get names)
+    # Early rejections are those with months 20-99 (organizational numbers)
+    processable_results = []
+    for result in all_pnr_results:
+        # Check if this was an early rejection
+        if result.get('rejection_reason') and 'organizational number' in result.get('rejection_reason', ''):
+            if verbosity > 1:
+                print(f"  Skipping early rejected {result['personnummer']} - no name extraction", file=sys.stderr)
+            continue
+        processable_results.append(result)
+
+    if not processable_results:
+        return []
+
+    # Step 3: Select ONE personnummer from processable results
+    if len(processable_results) > 1:
+        selected_results = select_closest_personnummer(processable_results, page_num, last_captured_pnr, verbosity)
     else:
-        selected_results = all_pnr_results
-        # No selection needed - only one valid personnummer
+        selected_results = processable_results
         if verbosity > 1:
-            pnr_info = all_pnr_results[0]
+            pnr_info = processable_results[0]
             status_parts = []
-            if pnr_info['luhn_valid']:
-                status_parts.append("valid")
+            if pnr_info.get('date_valid'):
+                if pnr_info['luhn_valid']:
+                    status_parts.append("valid")
+                else:
+                    status_parts.append("valid date, invalid Luhn")
             else:
-                status_parts.append("invalid Luhn")
+                status_parts.append(f"invalid date: {pnr_info.get('rejection_reason', 'unknown')}")
             if pnr_info.get('is_samordningsnummer'):
                 status_parts.append("samordningsnummer")
             status = ", ".join(status_parts)
-            print(f"  Using only valid personnummer: {pnr_info['personnummer']} ({status})", file=sys.stderr)
+            print(f"  Using personnummer: {pnr_info['personnummer']} ({status})", file=sys.stderr)
 
     if not selected_results:
         return []
 
     selected = selected_results[0]
 
-    # Step 3: Extract names for ONLY the selected personnummer - pass match info for special extractions
+    # Step 4: Extract names for the selected personnummer
+    # Names are extracted even for late rejections (invalid date/Luhn but not organizational)
     match_info = {
         'extraction_type': selected.get('extraction_type', 'normal'),
         'match_start': selected.get('match_start'),
@@ -2014,16 +2137,34 @@ def extract_personnummer_and_names(text, page_num, config, verbosity, include_in
     efternamn, fornamn = extract_names_for_personnummer(
         text, selected['personnummer'], selected['line_idx'], config, verbosity, match_info)
 
-    # Step 4: Return complete result
+    # Step 5: Determine if personnummer should be kept based on validity and include_invalid flag
+    final_personnummer = selected['personnummer']
+
+    # For late rejection: if both names were extracted, keep them even if personnummer is rejected
+    is_late_rejection = not selected['date_valid'] and not (
+        selected.get('rejection_reason') and 'organizational number' in selected.get('rejection_reason', '')
+    )
+
+    # Clear personnummer if invalid and not including invalid, but keep names for late rejection
+    if not selected['luhn_valid'] and not include_invalid and 'TF' not in selected['personnummer']:
+        if is_late_rejection and efternamn and fornamn:
+            if verbosity > 1:
+                print(f"  Late rejection of {selected['personnummer']}: keeping extracted names '{efternamn}, {fornamn}'", 
+                      file=sys.stderr)
+        final_personnummer = ""  # Clear invalid personnummer unless include_invalid is set
+
+    # Step 6: Return complete result
     return [{
-        'personnummer': selected['personnummer'],
+        'personnummer': final_personnummer if (include_invalid or selected['luhn_valid'] or 'TF' in selected['personnummer']) else "",
         'efternamn': efternamn,
         'fornamn': fornamn,
         'luhn_valid': selected['luhn_valid'],
         'original_pnr': selected['personnummer'],
         'date_valid': selected['date_valid'],
         'luhn_check_valid': selected['luhn_check_valid'],
-        'is_samordningsnummer': selected.get('is_samordningsnummer', False)
+        'is_samordningsnummer': selected.get('is_samordningsnummer', False),
+        'was_early_rejection': selected.get('rejection_reason') and 'organizational number' in selected.get('rejection_reason', ''),
+        'was_late_rejection': is_late_rejection
     }]
 
 def ocr_single_page(args):
@@ -2177,20 +2318,20 @@ def check_required_commands(verbosity=0):
     return True
 
 def report_names_not_in_lists(final_data, config, verbosity):
-    """Report personnummer with names not found in the SCB name lists.
+    """Report names not found in the SCB name lists, including those without personnummer.
 
-    Now sorts using the 95-year rule like other personnummer lists.
+    Separates reporting into two sections:
+    1. Names WITH personnummer not in SCB lists
+    2. Names WITHOUT personnummer not in SCB lists
     """
     if not config.use_scb_names or verbosity < 0:
         return
 
-    # Collect entries with names not in lists
-    not_in_lists = []
+    # Collect entries with names not in lists - separated by whether they have personnummer
+    with_pnr_not_in_lists = []
+    without_pnr_not_in_lists = []
 
     for entry in final_data:
-        if not entry['personnummer']:
-            continue
-
         fornamn = entry['fornamn']
         efternamn = entry['efternamn']
 
@@ -2201,23 +2342,29 @@ def report_names_not_in_lists(final_data, config, verbosity):
         efternamn_not_in_list = efternamn not in config.last_names_set
 
         if fornamn_not_in_list or efternamn_not_in_list:
-            not_in_lists.append({
-                'personnummer': entry['personnummer'],
+            item = {
+                'personnummer': entry.get('personnummer', ''),
                 'fornamn': fornamn,
                 'efternamn': efternamn,
                 'fornamn_not_in_list': fornamn_not_in_list,
                 'efternamn_not_in_list': efternamn_not_in_list,
                 'page': entry['page']
-            })
+            }
 
-    if not_in_lists:
-        print(f"\n=== Names Not in SCB Lists ===", file=sys.stderr)
-        print(f"Found {len(not_in_lists)} entries with names not in the official Swedish name lists:", 
+            if entry.get('personnummer'):
+                with_pnr_not_in_lists.append(item)
+            else:
+                without_pnr_not_in_lists.append(item)
+
+    # Report names WITH personnummer not in lists
+    if with_pnr_not_in_lists:
+        print(f"\n=== Names Not in SCB Lists (WITH Personnummer) ===", file=sys.stderr)
+        print(f"Found {len(with_pnr_not_in_lists)} entries with names not in the official Swedish name lists:", 
               file=sys.stderr)
 
         # Group by personnummer to avoid duplicates
         by_pnr = {}
-        for item in not_in_lists:
+        for item in with_pnr_not_in_lists:
             pnr = item['personnummer']
             if pnr not in by_pnr:
                 by_pnr[pnr] = item
@@ -2233,6 +2380,34 @@ def report_names_not_in_lists(final_data, config, verbosity):
                 issues.append(f"efternamn '{item['efternamn']}' not in list")
 
             print(f"  {pnr}: {item['efternamn']}, {item['fornamn']} - {'; '.join(issues)}", 
+                  file=sys.stderr)
+
+    # Report names WITHOUT personnummer not in lists
+    if without_pnr_not_in_lists:
+        print(f"\n=== Names Not in SCB Lists (WITHOUT Personnummer) ===", file=sys.stderr)
+        print(f"Found {len(without_pnr_not_in_lists)} entries without personnummer with names not in lists:", 
+              file=sys.stderr)
+
+        # Group by name to show page numbers
+        by_name = {}
+        for item in without_pnr_not_in_lists:
+            name_key = (item['efternamn'], item['fornamn'], item['fornamn_not_in_list'], item['efternamn_not_in_list'])
+            if name_key not in by_name:
+                by_name[name_key] = []
+            by_name[name_key].append(item['page'])
+
+        # Sort by name
+        sorted_names = sorted(by_name.items(), key=lambda x: (x[0][0], x[0][1]))
+
+        for (efternamn, fornamn, fornamn_not_in_list, efternamn_not_in_list), pages in sorted_names:
+            issues = []
+            if fornamn_not_in_list:
+                issues.append(f"förnamn '{fornamn}' not in list")
+            if efternamn_not_in_list:
+                issues.append(f"efternamn '{efternamn}' not in list")
+
+            pages_str = ', '.join(str(p) for p in sorted(pages))
+            print(f"  {efternamn}, {fornamn} (pages: {pages_str}) - {'; '.join(issues)}", 
                   file=sys.stderr)
 
 
