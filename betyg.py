@@ -43,7 +43,8 @@ class Config:
     # Name lists from SCB (will be populated)
     first_names_set: set = dataclasses.field(default_factory=set)
     last_names_set: set = dataclasses.field(default_factory=set)
-    use_json_names: bool = True
+    use_scb_names: bool = True  # RENAMED from use_json_names
+    scb_names_dict_path: str = None  # Path to temporary dictionary file
 
     # Name processing
     allowed_two_letter_words: set = dataclasses.field(default_factory=lambda: {
@@ -77,9 +78,9 @@ class Config:
     excessive_length_threshold: int = 15
     excessive_length_penalty: int = 100
 
-    # New: Name list matching bonuses
-    first_name_match_bonus: int = 500  # Bonus if fornamn exists in first names list
-    last_name_match_bonus: int = 500   # Bonus if efternamn exists in last names list
+    # Name list matching bonuses
+    first_name_match_bonus: int = 500
+    last_name_match_bonus: int = 500
 
     # Filter keywords
     filter_keywords: list = dataclasses.field(default_factory=lambda: 
@@ -171,11 +172,11 @@ def process_last_names(json_data, verbosity=0):
             print(f"  Warning: Error processing last names JSON: {e}", file=sys.stderr)
         return set()
 
-def load_or_fetch_name_lists(use_json_names=True, force_refresh=False, verbosity=0):
+def load_or_fetch_name_lists(use_scb_names=True, force_refresh=False, verbosity=0):
     """Load name lists from cache or fetch from SCB API."""
-    if not use_json_names:
+    if not use_scb_names:  # RENAMED from use_json_names
         if verbosity > 0:
-            print("  JSON name lists disabled by user", file=sys.stderr)
+            print("  SCB name lists disabled by user", file=sys.stderr)
         return set(), set()
 
     cache_dir = get_cache_dir()
@@ -197,7 +198,7 @@ def load_or_fetch_name_lists(use_json_names=True, force_refresh=False, verbosity
                 last_names = cache_data.get('last_names', set())
 
                 if verbosity >= 0:
-                    print(f"  Loaded name lists from cache: {len(first_names)} first names, {len(last_names)} last names", 
+                    print(f"  Loaded SCB name lists from cache: {len(first_names)} first names, {len(last_names)} last names", 
                           file=sys.stderr)
 
                 return first_names, last_names
@@ -234,7 +235,7 @@ def load_or_fetch_name_lists(use_json_names=True, force_refresh=False, verbosity
             temp_file.replace(cache_file)
 
             if verbosity > 0:
-                print(f"  Cached name lists to {cache_file}", file=sys.stderr)
+                print(f"  Cached SCB name lists to {cache_file}", file=sys.stderr)
         except (OSError, pickle.PickleError) as e:
             if verbosity >= 0:
                 print(f"  Warning: Failed to cache name lists: {e}", file=sys.stderr)
@@ -243,6 +244,46 @@ def load_or_fetch_name_lists(use_json_names=True, force_refresh=False, verbosity
         print(f"  Fetched {len(first_names)} first names and {len(last_names)} last names", file=sys.stderr)
 
     return first_names, last_names
+
+def create_scb_names_dictionary(first_names_set, last_names_set, verbosity=0):
+    """Create a temporary dictionary file with all SCB names for ocrmypdf.
+
+    Returns:
+        Path to the temporary dictionary file, or None if creation fails
+    """
+    if not first_names_set and not last_names_set:
+        if verbosity > 0:
+            print("  No SCB names available for dictionary", file=sys.stderr)
+        return None
+
+    try:
+        # Create a temporary file for the dictionary
+        import tempfile
+        fd, dict_path = tempfile.mkstemp(suffix='.txt', prefix='scb_names_dict_')
+
+        # Use names as-is from SCB (already properly capitalized)
+        # Only deduplicate if there's overlap between first/last names
+        all_names = first_names_set | last_names_set
+
+        # Write to file (one word per line)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            for name in sorted(all_names):
+                # Only include valid names (no spaces, reasonable length)
+                if name and ' ' not in name and len(name) <= 30:
+                    f.write(name + '\n')
+
+        if verbosity > 0:
+            total_names = len(all_names)
+            print(f"  Created SCB names dictionary with {total_names:,} unique names "
+                  f"({len(first_names_set):,} first + {len(last_names_set):,} last) for OCR enhancement", 
+                  file=sys.stderr)
+
+        return dict_path
+
+    except (OSError, IOError) as e:
+        if verbosity >= 0:
+            print(f"  Warning: Failed to create SCB names dictionary: {e}", file=sys.stderr)
+        return None
 
 def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, verbosity=0):
     """Check if names should be swapped based on name list membership."""
@@ -520,18 +561,18 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
         if len(fornamn) > config.excessive_length_threshold:
             score -= config.excessive_length_penalty
 
-        # NEW: Name list matching bonuses
-        if config.use_json_names:
+        # Name list matching bonuses (if SCB names enabled)
+        if config.use_scb_names:  # RENAMED from use_json_names
             if fornamn in config.first_names_set:
                 score += config.first_name_match_bonus
                 if verbosity > 1:
-                    print(f"    Name list bonus: '{fornamn}' found in first names (+{config.first_name_match_bonus})", 
+                    print(f"    SCB name bonus: '{fornamn}' found in first names (+{config.first_name_match_bonus})", 
                           file=sys.stderr)
 
             if efternamn in config.last_names_set:
                 score += config.last_name_match_bonus
                 if verbosity > 1:
-                    print(f"    Name list bonus: '{efternamn}' found in last names (+{config.last_name_match_bonus})", 
+                    print(f"    SCB name bonus: '{efternamn}' found in last names (+{config.last_name_match_bonus})", 
                           file=sys.stderr)
 
         scored_variants.append((name, count, score))
@@ -1578,8 +1619,8 @@ def extract_names_for_personnummer(
             lines, selected_line_idx, config, verbosity
         )
 
-    # NEW: Check if names should be swapped
-    if config.use_json_names and efternamn and fornamn:
+    # Check if names should be swapped (if SCB names enabled)
+    if config.use_scb_names and efternamn and fornamn:  # RENAMED from use_json_names
         efternamn, fornamn, swapped = check_and_swap_names(
             efternamn, fornamn, 
             config.first_names_set, config.last_names_set, 
@@ -1647,7 +1688,7 @@ def extract_personnummer_and_names(text, page_num, config, verbosity, include_in
     }]
 
 def ocr_single_page(args):
-    """OCR a single page with improved error handling."""
+    """OCR a single page with improved error handling and optional SCB names dictionary."""
     page_file, page_num, tmpdir, config = args
 
     text_file = os.path.join(tmpdir, f"page_{page_num:04d}.txt")
@@ -1656,7 +1697,7 @@ def ocr_single_page(args):
     if not os.path.exists(page_file):
         return (page_num, "", f"Input PDF page not found: {page_file}")
 
-    # OMP_THREAD_LIMIT is already set globally, no need to set it here
+    # Build OCR command
     ocr_cmd = [
         "ocrmypdf",
         "-q",  # Always quiet for ocrmypdf to avoid interleaved output
@@ -1665,17 +1706,22 @@ def ocr_single_page(args):
         "--optimize", str(config.ocr_optimize_level),
         "--jpeg-quality", str(config.jpeg_quality),
         "--png-quality", str(config.png_quality),
-        "--sidecar", text_file,
-        page_file,
-        "-"  # Output to stdout (we don't need the PDF)
+        "--sidecar", text_file
     ]
 
-    # Use safe subprocess run with timeout - don't use capture_output when setting stdout/stderr explicitly
+    # Add SCB names dictionary if available
+    if config.scb_names_dict_path and os.path.exists(config.scb_names_dict_path):
+        ocr_cmd.extend(["--user-words", config.scb_names_dict_path])
+
+    # Add input and output files
+    ocr_cmd.extend([page_file, "-"])  # Output to stdout (we don't need the PDF)
+
+    # Use safe subprocess run with timeout
     result = safe_subprocess_run(
         ocr_cmd, 
         f"OCR for page {page_num}",
         verbosity=0,  # Keep quiet during parallel processing
-        capture_output=False,  # Explicitly disable since we're setting stdout/stderr
+        capture_output=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -1789,7 +1835,7 @@ def check_required_commands(verbosity=0):
 
 def report_names_not_in_lists(final_data, config, verbosity):
     """Report personnummer with names not found in the SCB name lists."""
-    if not config.use_json_names or verbosity < 0:
+    if not config.use_scb_names or verbosity < 0:  # RENAMED from use_json_names
         return
 
     # Collect entries with names not in lists
@@ -1842,7 +1888,7 @@ def report_names_not_in_lists(final_data, config, verbosity):
 
 
 def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, inherit=True, 
-                autocorrect=True, use_json_names=True):
+                autocorrect=True, use_scb_names=True):  # RENAMED parameter
     """Process PDF file with OCR and extract data."""
     # Validate inputs and environment
     if not validate_input_file(pdf_path, verbosity):
@@ -1853,12 +1899,12 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
 
     # Create configuration instance
     config = Config()
-    config.use_json_names = use_json_names
+    config.use_scb_names = use_scb_names  # RENAMED
 
     # Load name lists if enabled
-    if use_json_names:
+    if use_scb_names:
         config.first_names_set, config.last_names_set = load_or_fetch_name_lists(
-            use_json_names=True, 
+            use_scb_names=True,  # RENAMED parameter
             force_refresh=False, 
             verbosity=verbosity
         )
@@ -1880,11 +1926,15 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
         else:
             print("  Inheritance: ENABLED - pages without personnummer inherit from previous", file=sys.stderr)
 
-        if use_json_names:
-            print(f"  Name lists: ENABLED - using {len(config.first_names_set)} first names and "
-                  f"{len(config.last_names_set)} last names", file=sys.stderr)
+        if use_scb_names:
+            if config.first_names_set or config.last_names_set:
+                print(f"  SCB name lists: ENABLED - {len(config.first_names_set)} first names, "
+                      f"{len(config.last_names_set)} last names (used for OCR enhancement and validation)", 
+                      file=sys.stderr)
+            else:
+                print("  SCB name lists: ENABLED but empty or could not be fetched", file=sys.stderr)
         else:
-            print("  Name lists: DISABLED", file=sys.stderr)
+            print("  SCB name lists: DISABLED", file=sys.stderr)
 
     # Create temporary directory for processing with proper error handling
     tmpdir = None
@@ -1899,8 +1949,8 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
 
             final_data = apply_inheritance_and_resolve_names(raw_data, total_pages, inherit, config, verbosity, include_invalid)
 
-            # NEW: Add summary of names not in lists
-            if use_json_names:
+            # Report names not in lists if SCB names enabled
+            if use_scb_names:
                 report_names_not_in_lists(final_data, config, verbosity)
 
             return final_data
@@ -2070,7 +2120,7 @@ def setup_pdf_pages(pdf_path, tmpdir, verbosity):
 
 
 def run_parallel_ocr(tmpdir, total_pages, max_workers, config, verbosity):
-    """Run OCR on all pages in parallel and return page texts."""
+    """Run OCR on all pages in parallel with optional SCB names dictionary."""
     # Determine number of workers
     if max_workers is None:
         num_workers = get_optimal_workers(total_pages, verbosity)
@@ -2079,10 +2129,20 @@ def run_parallel_ocr(tmpdir, total_pages, max_workers, config, verbosity):
         if verbosity > 0:
             print(f"  Using user-specified {num_workers} parallel OCR workers", file=sys.stderr)
 
+    # Create SCB names dictionary if enabled
+    if config.use_scb_names and (config.first_names_set or config.last_names_set):
+        config.scb_names_dict_path = create_scb_names_dictionary(
+            config.first_names_set, 
+            config.last_names_set, 
+            verbosity
+        )
+        if config.scb_names_dict_path and verbosity >= 0:
+            print(f"  Using SCB names dictionary for enhanced OCR recognition", file=sys.stderr)
+
     if verbosity >= 0:
         print("Running OCR on pages...", file=sys.stderr)
 
-    # Prepare arguments for parallel processing (now includes config)
+    # Prepare arguments for parallel processing
     ocr_args = []
     for i in range(1, total_pages + 1):
         page_file = os.path.join(tmpdir, f"page_{i:04d}.pdf")
@@ -2106,6 +2166,15 @@ def run_parallel_ocr(tmpdir, total_pages, max_workers, config, verbosity):
                 errors.append((page_num, error))
 
             progress.update(page_num)
+
+    # Clean up the SCB names dictionary file
+    if config.scb_names_dict_path and os.path.exists(config.scb_names_dict_path):
+        try:
+            os.remove(config.scb_names_dict_path)
+            if verbosity > 1:
+                print(f"  Cleaned up SCB names dictionary file", file=sys.stderr)
+        except OSError:
+            pass  # Not critical if cleanup fails
 
     # Report any errors after progress is complete
     if errors and verbosity >= 0:
@@ -2421,8 +2490,8 @@ def main():
                         help='Disable inheritance of personnummer from previous pages')
     parser.add_argument('--no-autocorrect', action='store_true',
                         help='Disable automatic correction of single-digit OCR errors')
-    parser.add_argument('--no-json-names', action='store_true',
-                        help='Disable using JSON-fetched Swedish name lists (default: use them)')
+    parser.add_argument('--no-scb-names', action='store_true',  # RENAMED from --no-json-names
+                        help='Disable using SCB Swedish name lists for OCR enhancement and validation')
 
     args = parser.parse_args()
 
@@ -2449,7 +2518,8 @@ def main():
 
     # Process the PDF
     data = process_pdf(args.pdf_file, verbosity, args.jobs, args.include_invalid, 
-                      not args.no_inheritance, not args.no_autocorrect, not args.no_json_names)
+                      not args.no_inheritance, not args.no_autocorrect, 
+                      not args.no_scb_names)  # RENAMED
 
     # Output CSV
     csv_writer = csv.writer(sys.stdout)
