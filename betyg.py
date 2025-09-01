@@ -20,6 +20,12 @@ import unicodedata
 import dataclasses
 import unidecode
 from typing import List, Dict, Any, Tuple, Optional
+import json
+import pickle
+import hashlib
+from pathlib import Path
+from urllib.request import urlopen
+from urllib.error import URLError
 
 @dataclasses.dataclass
 class Config:
@@ -33,6 +39,11 @@ class Config:
 
     # Personnummer patterns
     personnummer_pattern: str = r'[0-9]{6}\-([0-9]{4}|TF[0-9]{2})'
+
+    # Name lists from SCB (will be populated)
+    first_names_set: set = dataclasses.field(default_factory=set)
+    last_names_set: set = dataclasses.field(default_factory=set)
+    use_json_names: bool = True
 
     # Name processing
     allowed_two_letter_words: set = dataclasses.field(default_factory=lambda: {
@@ -63,8 +74,12 @@ class Config:
     # Scoring weights
     scandinavian_bonus: int = 1000
     all_caps_penalty: int = 50
-    excessive_length_threshold: int = 15  # Names longer than this get penalized
-    excessive_length_penalty: int = 100   # Penalty per name component over threshold
+    excessive_length_threshold: int = 15
+    excessive_length_penalty: int = 100
+
+    # New: Name list matching bonuses
+    first_name_match_bonus: int = 500  # Bonus if fornamn exists in first names list
+    last_name_match_bonus: int = 500   # Bonus if efternamn exists in last names list
 
     # Filter keywords
     filter_keywords: list = dataclasses.field(default_factory=lambda: 
@@ -72,6 +87,180 @@ class Config:
 
     # Name cleaning
     unwanted_chars_pattern: str = r'[|\\/\[\]{}()<>@#$%^&*+=~`"_;:!?\n\r\t0-9]'
+
+def get_cache_dir():
+    """Get or create a cache directory for storing name lists."""
+    cache_dir = Path.home() / '.cache' / 'scb_names'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+def fetch_json_from_url(url, verbosity=0):
+    """Fetch JSON data from a URL."""
+    try:
+        if verbosity > 0:
+            print(f"  Fetching data from {url}...", file=sys.stderr)
+
+        with urlopen(url, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+
+        return data
+    except URLError as e:
+        if verbosity >= 0:
+            print(f"  Warning: Failed to fetch from {url}: {e}", file=sys.stderr)
+        return None
+    except json.JSONDecodeError as e:
+        if verbosity >= 0:
+            print(f"  Warning: Invalid JSON from {url}: {e}", file=sys.stderr)
+        return None
+
+def process_first_names(json_data, verbosity=0):
+    """Process first names JSON data according to requirements."""
+    if not json_data or 'variables' not in json_data:
+        return set()
+
+    try:
+        # Get the values array from variables[0]
+        values = json_data['variables'][0]['values']
+
+        # Process each name
+        processed_names = set()
+        for name in values:
+            # Strip trailing whitespace
+            name = name.rstrip()
+
+            # Remove last M or K character
+            if name and name[-1] in ['M', 'K']:
+                name = name[:-1].rstrip()
+
+            if name:  # Only add non-empty names
+                processed_names.add(name)
+
+        if verbosity > 1:
+            print(f"    Processed {len(processed_names)} unique first names", file=sys.stderr)
+
+        return processed_names
+    except (KeyError, IndexError, TypeError) as e:
+        if verbosity >= 0:
+            print(f"  Warning: Error processing first names JSON: {e}", file=sys.stderr)
+        return set()
+
+def process_last_names(json_data, verbosity=0):
+    """Process last names JSON data according to requirements."""
+    if not json_data or 'variables' not in json_data:
+        return set()
+
+    try:
+        # Get the values array from variables[0]
+        values = json_data['variables'][0]['values']
+
+        # Process each name
+        processed_names = set()
+        for name in values:
+            # Strip trailing whitespace
+            name = name.rstrip()
+
+            if name:  # Only add non-empty names
+                processed_names.add(name)
+
+        if verbosity > 1:
+            print(f"    Processed {len(processed_names)} unique last names", file=sys.stderr)
+
+        return processed_names
+    except (KeyError, IndexError, TypeError) as e:
+        if verbosity >= 0:
+            print(f"  Warning: Error processing last names JSON: {e}", file=sys.stderr)
+        return set()
+
+def load_or_fetch_name_lists(use_json_names=True, force_refresh=False, verbosity=0):
+    """Load name lists from cache or fetch from SCB API."""
+    if not use_json_names:
+        if verbosity > 0:
+            print("  JSON name lists disabled by user", file=sys.stderr)
+        return set(), set()
+
+    cache_dir = get_cache_dir()
+    cache_file = cache_dir / 'scb_names.pkl'
+
+    # URLs for the APIs
+    first_names_url = "https://api.scb.se/OV0104/v1/doris/en/ssd/BE/BE0001/BE0001G/BE0001FNamn10"
+    last_names_url = "https://api.scb.se/OV0104/v1/doris/en/ssd/BE/BE0001/BE0001G/BE0001ENamn10"
+
+    # Try to load from cache first
+    if not force_refresh and cache_file.exists():
+        try:
+            with open(cache_file, 'rb') as f:
+                cache_data = pickle.load(f)
+
+            # Check cache version and validity
+            if cache_data.get('version') == '1.0':
+                first_names = cache_data.get('first_names', set())
+                last_names = cache_data.get('last_names', set())
+
+                if verbosity >= 0:
+                    print(f"  Loaded name lists from cache: {len(first_names)} first names, {len(last_names)} last names", 
+                          file=sys.stderr)
+
+                return first_names, last_names
+        except (pickle.PickleError, KeyError, EOFError) as e:
+            if verbosity >= 0:
+                print(f"  Warning: Cache file corrupted, will fetch fresh data: {e}", file=sys.stderr)
+
+    # Fetch fresh data
+    if verbosity >= 0:
+        print("Fetching Swedish name lists from SCB API...", file=sys.stderr)
+
+    # Fetch first names
+    first_names_json = fetch_json_from_url(first_names_url, verbosity)
+    first_names = process_first_names(first_names_json, verbosity) if first_names_json else set()
+
+    # Fetch last names
+    last_names_json = fetch_json_from_url(last_names_url, verbosity)
+    last_names = process_last_names(last_names_json, verbosity) if last_names_json else set()
+
+    # Cache the results
+    if first_names or last_names:
+        try:
+            cache_data = {
+                'version': '1.0',
+                'first_names': first_names,
+                'last_names': last_names,
+                'timestamp': datetime.now().isoformat()
+            }
+
+            # Write to temporary file first, then rename (atomic operation)
+            temp_file = cache_file.with_suffix('.tmp')
+            with open(temp_file, 'wb') as f:
+                pickle.dump(cache_data, f)
+            temp_file.replace(cache_file)
+
+            if verbosity > 0:
+                print(f"  Cached name lists to {cache_file}", file=sys.stderr)
+        except (OSError, pickle.PickleError) as e:
+            if verbosity >= 0:
+                print(f"  Warning: Failed to cache name lists: {e}", file=sys.stderr)
+
+    if verbosity >= 0:
+        print(f"  Fetched {len(first_names)} first names and {len(last_names)} last names", file=sys.stderr)
+
+    return first_names, last_names
+
+def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, verbosity=0):
+    """Check if names should be swapped based on name list membership."""
+    if not efternamn or not fornamn:
+        return efternamn, fornamn, False
+
+    # Check the specific swap condition:
+    # fornamn exists in last_names_set AND efternamn exists in first_names_set
+    fornamn_in_last = fornamn in last_names_set
+    efternamn_in_first = efternamn in first_names_set
+
+    if fornamn_in_last and efternamn_in_first:
+        if verbosity > 1:
+            print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
+                  f"(fornamn found in last names, efternamn found in first names)", file=sys.stderr)
+        return fornamn, efternamn, True
+
+    return efternamn, fornamn, False
 
 
 # Set OMP_THREAD_LIMIT globally if not already set
@@ -291,7 +480,8 @@ def merge_short_words_with_nearest_shortest(words, config, verbosity=0):
     return words_copy
 
 def select_best_name_variant(name_counter, pnr, config, verbosity):
-    """Select the best name variant with bias towards Scandinavian characters, against ALL CAPS, and against excessive length."""
+    """Select the best name variant with bias towards Scandinavian characters, against ALL CAPS, 
+    against excessive length, and towards names in SCB lists."""
     if len(name_counter) == 1:
         return list(name_counter.keys())[0]
 
@@ -303,143 +493,61 @@ def select_best_name_variant(name_counter, pnr, config, verbosity):
         base_key = (base_efter, base_for)
         base_groups[base_key].append((name, count))
 
-    # If all variants have the same base form, use enhanced scoring
-    if len(base_groups) == 1:
-        variants = list(base_groups.values())[0]
+    # Score all variants
+    all_variants = []
+    for group_variants in base_groups.values():
+        all_variants.extend(group_variants)
 
-        # Score each variant with multiple criteria
-        scored_variants = []
-        for name, count in variants:
-            efternamn, fornamn = name
-            full_name = efternamn + fornamn
+    scored_variants = []
+    for name, count in all_variants:
+        efternamn, fornamn = name
+        full_name = efternamn + fornamn
 
-            # Base score from occurrence count
-            score = count
+        # Base score from occurrence count
+        score = count
 
-            # Scandinavian character bonus (heavily weighted)
-            scand_count = count_scandinavian_chars(full_name)
-            score += scand_count * config.scandinavian_bonus
+        # Scandinavian character bonus (heavily weighted)
+        scand_count = count_scandinavian_chars(full_name)
+        score += scand_count * config.scandinavian_bonus
 
-            # ALL CAPS penalty
-            caps_penalty = 0
-            if is_all_caps(efternamn) or is_all_caps(fornamn):
-                score -= config.all_caps_penalty
-                caps_penalty = config.all_caps_penalty
+        # ALL CAPS penalty
+        if is_all_caps(efternamn) or is_all_caps(fornamn):
+            score -= config.all_caps_penalty
 
-            # Excessive length penalty
-            length_penalty = 0
-            if len(efternamn) > config.excessive_length_threshold:
-                length_penalty += config.excessive_length_penalty
-                score -= config.excessive_length_penalty
-            if len(fornamn) > config.excessive_length_threshold:
-                length_penalty += config.excessive_length_penalty
-                score -= config.excessive_length_penalty
+        # Excessive length penalty
+        if len(efternamn) > config.excessive_length_threshold:
+            score -= config.excessive_length_penalty
+        if len(fornamn) > config.excessive_length_threshold:
+            score -= config.excessive_length_penalty
 
-            scored_variants.append((name, count, scand_count, caps_penalty, length_penalty, score))
+        # NEW: Name list matching bonuses
+        if config.use_json_names:
+            if fornamn in config.first_names_set:
+                score += config.first_name_match_bonus
+                if verbosity > 1:
+                    print(f"    Name list bonus: '{fornamn}' found in first names (+{config.first_name_match_bonus})", 
+                          file=sys.stderr)
 
-        # Sort by score (highest first)
-        scored_variants.sort(key=lambda x: x[5], reverse=True)
-        selected = scored_variants[0][0]
+            if efternamn in config.last_names_set:
+                score += config.last_name_match_bonus
+                if verbosity > 1:
+                    print(f"    Name list bonus: '{efternamn}' found in last names (+{config.last_name_match_bonus})", 
+                          file=sys.stderr)
 
-        if verbosity > 0:
-            # Detailed logging for different scenarios
-            max_count = max(v[1] for v in scored_variants)
-            tied_variants = [v for v in scored_variants if v[1] == max_count]
+        scored_variants.append((name, count, score))
 
-            # Determine what kind of selection this was
-            selection_reason = None
-            winner_has_scand = has_scandinavian_chars(selected[0] + selected[1])
-            winner_has_caps = is_all_caps(selected[0]) or is_all_caps(selected[1])
-            winner_too_long = len(selected[0]) > config.excessive_length_threshold or len(selected[1]) > config.excessive_length_threshold
+    # Sort by score (highest first)
+    scored_variants.sort(key=lambda x: x[2], reverse=True)
+    selected = scored_variants[0][0]
 
-            # Case 1: Tie broken by advanced scoring
-            if len(tied_variants) > 1:
-                if winner_has_scand:
-                    selection_reason = "TIE broken by Scandinavian preference!"
-                elif not winner_too_long and any(len(v[0][0]) > config.excessive_length_threshold or len(v[0][1]) > config.excessive_length_threshold for v in tied_variants):
-                    selection_reason = "TIE broken by length preference!"
-                elif winner_has_caps:
-                    selection_reason = "TIE broken by ALL CAPS penalty avoidance!"
-                else:
-                    selection_reason = "TIE - selected first variant"
+    if verbosity > 0 and len(scored_variants) > 1:
+        print(f"  {pnr}: Selected from {len(scored_variants)} variants:", file=sys.stderr)
+        for name, count, score in scored_variants[:3]:  # Show top 3
+            marker = " ← SELECTED" if name == selected else ""
+            print(f"    {name[0]}, {name[1]} (occurs {count}x, score={score}){marker}", 
+                  file=sys.stderr)
 
-            # Case 2: Advanced scoring overrode frequency
-            elif selected != max(variants, key=lambda x: x[1])[0]:
-                if winner_has_scand:
-                    selection_reason = "Scandinavian preference OVERRIDES frequency!"
-                elif not winner_too_long:
-                    selection_reason = "Length preference OVERRIDES frequency!"
-                elif any(is_all_caps(v[0][0]) or is_all_caps(v[0][1]) 
-                        for v in scored_variants if v[1] == max_count):
-                    selection_reason = "ALL CAPS penalty avoidance OVERRIDES frequency!"
-
-            # Case 3: Standard selection (most common, possibly with bonuses)
-            else:
-                selection_reason = "Selected by occurrence count"
-                if winner_has_scand:
-                    selection_reason += " (also has Scandinavian chars)"
-
-            print(f"  {pnr}: {selection_reason}", file=sys.stderr)
-            for name, count, scand_count, caps_penalty, length_penalty, score in scored_variants:
-                marker = " ← SELECTED" if name == selected else ""
-                penalties = []
-                if caps_penalty > 0:
-                    penalties.append(f"-{caps_penalty} ALL CAPS")
-                if length_penalty > 0:
-                    penalties.append(f"-{length_penalty} excessive length")
-
-                penalty_str = f" ({', '.join(penalties)})" if penalties else ""
-                scand_str = f", +{scand_count * config.scandinavian_bonus} Scand" if scand_count > 0 else ""
-                print(f"    {name[0]}, {name[1]} (occurs {count}x{scand_str}{penalty_str}, score={score}){marker}", 
-                      file=sys.stderr)
-
-        return selected
-    else:
-        # Variants have different base forms, use enhanced scoring but less verbose logging
-        all_variants = []
-        for group_variants in base_groups.values():
-            all_variants.extend(group_variants)
-
-        # Score each variant
-        scored_variants = []
-        for name, count in all_variants:
-            efternamn, fornamn = name
-            full_name = efternamn + fornamn
-
-            score = count
-            scand_count = count_scandinavian_chars(full_name)
-            score += scand_count * config.scandinavian_bonus
-
-            if is_all_caps(efternamn) or is_all_caps(fornamn):
-                score -= config.all_caps_penalty
-
-            # Apply length penalty
-            if len(efternamn) > config.excessive_length_threshold:
-                score -= config.excessive_length_penalty
-            if len(fornamn) > config.excessive_length_threshold:
-                score -= config.excessive_length_penalty
-
-            scored_variants.append((name, count, score))
-
-        # Sort by score
-        scored_variants.sort(key=lambda x: x[2], reverse=True)
-        selected = scored_variants[0][0]
-
-        # Check for ties in this case too
-        max_count = max(v[1] for v in scored_variants)
-        tied = [item for item in scored_variants if item[1] == max_count]
-
-        if verbosity > 0:
-            if len(tied) > 1:
-                print(f"  {pnr}: TIE between different base names - enhanced scoring applied:", file=sys.stderr)
-            else:
-                print(f"  {pnr}: Enhanced scoring applied:", file=sys.stderr)
-
-            for name, count, score in scored_variants:
-                marker = " ← SELECTED" if name == selected else ""
-                print(f"    {name[0]}, {name[1]} (occurs {count}x, score={score}){marker}", file=sys.stderr)
-
-        return selected
+    return selected
 
 def clean_name(name, config):
     """Clean name by removing unusual characters but keeping international characters."""
@@ -1456,10 +1564,7 @@ def extract_names_for_personnummer(
     verbosity: int, 
     match_info: Optional[Dict[str, Any]] = None
 ) -> Tuple[str, str]:
-    """Extract names for a specific selected personnummer.
-
-    This function has been simplified by delegating to helper functions.
-    """
+    """Extract names for a specific selected personnummer with name swapping check."""
     lines = text.split('\n')
 
     # Step 1: Try same line extraction
@@ -1467,13 +1572,21 @@ def extract_names_for_personnummer(
         lines[selected_line_idx], selected_pnr, config, verbosity, match_info
     )
 
-    if efternamn:
-        return efternamn, fornamn
+    if not efternamn:
+        # Step 2: Search previous lines
+        efternamn, fornamn = _search_previous_lines_for_names(
+            lines, selected_line_idx, config, verbosity
+        )
 
-    # Step 2: Search previous lines
-    return _search_previous_lines_for_names(
-        lines, selected_line_idx, config, verbosity
-    )
+    # NEW: Check if names should be swapped
+    if config.use_json_names and efternamn and fornamn:
+        efternamn, fornamn, swapped = check_and_swap_names(
+            efternamn, fornamn, 
+            config.first_names_set, config.last_names_set, 
+            verbosity
+        )
+
+    return efternamn, fornamn
 
 
 def extract_personnummer_and_names(text, page_num, config, verbosity, include_invalid=False, last_captured_pnr=None):
@@ -1674,8 +1787,62 @@ def check_required_commands(verbosity=0):
 
     return True
 
+def report_names_not_in_lists(final_data, config, verbosity):
+    """Report personnummer with names not found in the SCB name lists."""
+    if not config.use_json_names or verbosity < 0:
+        return
 
-def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, inherit=True, autocorrect=True):
+    # Collect entries with names not in lists
+    not_in_lists = []
+
+    for entry in final_data:
+        if not entry['personnummer']:
+            continue
+
+        fornamn = entry['fornamn']
+        efternamn = entry['efternamn']
+
+        if not fornamn or not efternamn:
+            continue
+
+        fornamn_not_in_list = fornamn not in config.first_names_set
+        efternamn_not_in_list = efternamn not in config.last_names_set
+
+        if fornamn_not_in_list or efternamn_not_in_list:
+            not_in_lists.append({
+                'personnummer': entry['personnummer'],
+                'fornamn': fornamn,
+                'efternamn': efternamn,
+                'fornamn_not_in_list': fornamn_not_in_list,
+                'efternamn_not_in_list': efternamn_not_in_list,
+                'page': entry['page']
+            })
+
+    if not_in_lists:
+        print(f"\n=== Names Not in SCB Lists ===", file=sys.stderr)
+        print(f"Found {len(not_in_lists)} entries with names not in the official Swedish name lists:", 
+              file=sys.stderr)
+
+        # Group by personnummer to avoid duplicates
+        by_pnr = {}
+        for item in not_in_lists:
+            pnr = item['personnummer']
+            if pnr not in by_pnr:
+                by_pnr[pnr] = item
+
+        for pnr, item in sorted(by_pnr.items()):
+            issues = []
+            if item['fornamn_not_in_list']:
+                issues.append(f"förnamn '{item['fornamn']}' not in list")
+            if item['efternamn_not_in_list']:
+                issues.append(f"efternamn '{item['efternamn']}' not in list")
+
+            print(f"  {pnr}: {item['efternamn']}, {item['fornamn']} - {'; '.join(issues)}", 
+                  file=sys.stderr)
+
+
+def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, inherit=True, 
+                autocorrect=True, use_json_names=True):
     """Process PDF file with OCR and extract data."""
     # Validate inputs and environment
     if not validate_input_file(pdf_path, verbosity):
@@ -1686,6 +1853,15 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
 
     # Create configuration instance
     config = Config()
+    config.use_json_names = use_json_names
+
+    # Load name lists if enabled
+    if use_json_names:
+        config.first_names_set, config.last_names_set = load_or_fetch_name_lists(
+            use_json_names=True, 
+            force_refresh=False, 
+            verbosity=verbosity
+        )
 
     if verbosity >= 0:
         print(f"Processing: {pdf_path}", file=sys.stderr)
@@ -1704,6 +1880,12 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
         else:
             print("  Inheritance: ENABLED - pages without personnummer inherit from previous", file=sys.stderr)
 
+        if use_json_names:
+            print(f"  Name lists: ENABLED - using {len(config.first_names_set)} first names and "
+                  f"{len(config.last_names_set)} last names", file=sys.stderr)
+        else:
+            print("  Name lists: DISABLED", file=sys.stderr)
+
     # Create temporary directory for processing with proper error handling
     tmpdir = None
     try:
@@ -1716,6 +1898,11 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
                 raw_data = apply_autocorrection(raw_data, verbosity)
 
             final_data = apply_inheritance_and_resolve_names(raw_data, total_pages, inherit, config, verbosity, include_invalid)
+
+            # NEW: Add summary of names not in lists
+            if use_json_names:
+                report_names_not_in_lists(final_data, config, verbosity)
+
             return final_data
 
     except KeyboardInterrupt:
@@ -2234,6 +2421,8 @@ def main():
                         help='Disable inheritance of personnummer from previous pages')
     parser.add_argument('--no-autocorrect', action='store_true',
                         help='Disable automatic correction of single-digit OCR errors')
+    parser.add_argument('--no-json-names', action='store_true',
+                        help='Disable using JSON-fetched Swedish name lists (default: use them)')
 
     args = parser.parse_args()
 
@@ -2260,7 +2449,7 @@ def main():
 
     # Process the PDF
     data = process_pdf(args.pdf_file, verbosity, args.jobs, args.include_invalid, 
-                      not args.no_inheritance, not args.no_autocorrect)
+                      not args.no_inheritance, not args.no_autocorrect, not args.no_json_names)
 
     # Output CSV
     csv_writer = csv.writer(sys.stdout)
@@ -2279,6 +2468,7 @@ def main():
             entry['efternamn'],
             entry['fornamn']
         ])
+
 
 if __name__ == '__main__':
     main()
