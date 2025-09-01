@@ -309,10 +309,20 @@ def create_personnummer_patterns_file(verbosity=0):
             r'\d\d\d\d\d\d\d\d\d\d',
             # With space instead of hyphen (common OCR error)
             r'\d\d\d\d\d\d \d\d\d\d',
+            # variants
+            r'\d\d \d\d \d\d  - \d\d\d\d',
+            r'\d\d\d\d\d\d  - \d\d\d\d',
             # Partial patterns to help with segments
             r'\d\d\d\d\d\d',  # Birth date part
             r'-\d\d\d\d',     # Last 4 digits with hyphen
             r'-TF\d\d',       # TF suffix with hyphen
+            r'- \d\d \d\d',
+            r'- TF \d\d',
+            # variants
+            r'\d\d\d\d',
+            r'TF\d\d',
+            r'\d\d \d\d',
+            r'TF \d\d',
         ]
 
         # Write patterns to file (one per line)
