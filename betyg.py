@@ -39,11 +39,13 @@ class Config:
 
     # Personnummer patterns
     personnummer_pattern: str = r'[0-9]{6}\-([0-9]{4}|TF[0-9]{2})'
+    use_pnr_patterns: bool = True  # NEW: Enable personnummer pattern hints for OCR
+    pnr_patterns_path: str = None  # NEW: Path to temporary patterns file
 
     # Name lists from SCB (will be populated)
     first_names_set: set = dataclasses.field(default_factory=set)
     last_names_set: set = dataclasses.field(default_factory=set)
-    use_scb_names: bool = True  # RENAMED from use_json_names
+    use_scb_names: bool = True
     scb_names_dict_path: str = None  # Path to temporary dictionary file
 
     # Name processing
@@ -284,6 +286,51 @@ def create_scb_names_dictionary(first_names_set, last_names_set, verbosity=0):
         if verbosity >= 0:
             print(f"  Warning: Failed to create SCB names dictionary: {e}", file=sys.stderr)
         return None
+
+def create_personnummer_patterns_file(verbosity=0):
+    """Create a temporary patterns file to help Tesseract recognize personnummer formats.
+
+    Returns:
+        Path to the temporary patterns file, or None if creation fails
+    """
+    try:
+        # Create a temporary file for the patterns
+        import tempfile
+        fd, patterns_path = tempfile.mkstemp(suffix='.txt', prefix='pnr_patterns_')
+
+        # Define Tesseract patterns for personnummer
+        # Format: YYMMDD-XXXX or YYMMDD-TFXX
+        patterns = [
+            # Standard format: 6 digits, hyphen, 4 digits
+            r'\d\d\d\d\d\d-\d\d\d\d',
+            # TF format: 6 digits, hyphen, TF, 2 digits  
+            r'\d\d\d\d\d\d-TF\d\d',
+            # Also include without hyphen (sometimes OCR misses it)
+            r'\d\d\d\d\d\d\d\d\d\d',
+            # With space instead of hyphen (common OCR error)
+            r'\d\d\d\d\d\d \d\d\d\d',
+            # Partial patterns to help with segments
+            r'\d\d\d\d\d\d',  # Birth date part
+            r'-\d\d\d\d',     # Last 4 digits with hyphen
+            r'-TF\d\d',       # TF suffix with hyphen
+        ]
+
+        # Write patterns to file (one per line)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            for pattern in patterns:
+                f.write(pattern + '\n')
+
+        if verbosity > 1:
+            print(f"  Created personnummer patterns file with {len(patterns)} patterns for OCR", 
+                  file=sys.stderr)
+
+        return patterns_path
+
+    except (OSError, IOError) as e:
+        if verbosity >= 0:
+            print(f"  Warning: Failed to create personnummer patterns file: {e}", file=sys.stderr)
+        return None
+
 
 def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, verbosity=0):
     """Check if names should be swapped based on name list membership.
@@ -1703,7 +1750,7 @@ def extract_personnummer_and_names(text, page_num, config, verbosity, include_in
     }]
 
 def ocr_single_page(args):
-    """OCR a single page with improved error handling and optional SCB names dictionary."""
+    """OCR a single page with improved error handling, SCB names dictionary, and personnummer patterns."""
     page_file, page_num, tmpdir, config = args
 
     text_file = os.path.join(tmpdir, f"page_{page_num:04d}.txt")
@@ -1727,6 +1774,10 @@ def ocr_single_page(args):
     # Add SCB names dictionary if available
     if config.scb_names_dict_path and os.path.exists(config.scb_names_dict_path):
         ocr_cmd.extend(["--user-words", config.scb_names_dict_path])
+
+    # Add personnummer patterns if available
+    if config.pnr_patterns_path and os.path.exists(config.pnr_patterns_path):
+        ocr_cmd.extend(["--user-patterns", config.pnr_patterns_path])
 
     # Add input and output files
     ocr_cmd.extend([page_file, "-"])  # Output to stdout (we don't need the PDF)
@@ -1903,7 +1954,7 @@ def report_names_not_in_lists(final_data, config, verbosity):
 
 
 def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, inherit=True, 
-                autocorrect=True, use_scb_names=True):  # RENAMED parameter
+                autocorrect=True, use_scb_names=True, use_pnr_patterns=True):  # NEW parameter
     """Process PDF file with OCR and extract data."""
     # Validate inputs and environment
     if not validate_input_file(pdf_path, verbosity):
@@ -1914,12 +1965,13 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
 
     # Create configuration instance
     config = Config()
-    config.use_scb_names = use_scb_names  # RENAMED
+    config.use_scb_names = use_scb_names
+    config.use_pnr_patterns = use_pnr_patterns  # NEW
 
     # Load name lists if enabled
     if use_scb_names:
         config.first_names_set, config.last_names_set = load_or_fetch_name_lists(
-            use_scb_names=True,  # RENAMED parameter
+            use_scb_names=True,
             force_refresh=False, 
             verbosity=verbosity
         )
@@ -1950,6 +2002,11 @@ def process_pdf(pdf_path, verbosity, max_workers=None, include_invalid=False, in
                 print("  SCB name lists: ENABLED but empty or could not be fetched", file=sys.stderr)
         else:
             print("  SCB name lists: DISABLED", file=sys.stderr)
+
+        if use_pnr_patterns:
+            print("  Personnummer patterns: ENABLED - helping OCR recognize ID number formats", file=sys.stderr)
+        else:
+            print("  Personnummer patterns: DISABLED", file=sys.stderr)
 
     # Create temporary directory for processing with proper error handling
     tmpdir = None
@@ -2135,7 +2192,7 @@ def setup_pdf_pages(pdf_path, tmpdir, verbosity):
 
 
 def run_parallel_ocr(tmpdir, total_pages, max_workers, config, verbosity):
-    """Run OCR on all pages in parallel with optional SCB names dictionary."""
+    """Run OCR on all pages in parallel with SCB names dictionary and personnummer patterns."""
     # Determine number of workers
     if max_workers is None:
         num_workers = get_optimal_workers(total_pages, verbosity)
@@ -2153,6 +2210,12 @@ def run_parallel_ocr(tmpdir, total_pages, max_workers, config, verbosity):
         )
         if config.scb_names_dict_path and verbosity >= 0:
             print(f"  Using SCB names dictionary for enhanced OCR recognition", file=sys.stderr)
+
+    # Create personnummer patterns file if enabled
+    if config.use_pnr_patterns:
+        config.pnr_patterns_path = create_personnummer_patterns_file(verbosity)
+        if config.pnr_patterns_path and verbosity >= 0:
+            print(f"  Using personnummer pattern hints for enhanced OCR recognition", file=sys.stderr)
 
     if verbosity >= 0:
         print("Running OCR on pages...", file=sys.stderr)
@@ -2182,12 +2245,20 @@ def run_parallel_ocr(tmpdir, total_pages, max_workers, config, verbosity):
 
             progress.update(page_num)
 
-    # Clean up the SCB names dictionary file
+    # Clean up temporary files
     if config.scb_names_dict_path and os.path.exists(config.scb_names_dict_path):
         try:
             os.remove(config.scb_names_dict_path)
             if verbosity > 1:
                 print(f"  Cleaned up SCB names dictionary file", file=sys.stderr)
+        except OSError:
+            pass  # Not critical if cleanup fails
+
+    if config.pnr_patterns_path and os.path.exists(config.pnr_patterns_path):
+        try:
+            os.remove(config.pnr_patterns_path)
+            if verbosity > 1:
+                print(f"  Cleaned up personnummer patterns file", file=sys.stderr)
         except OSError:
             pass  # Not critical if cleanup fails
 
@@ -2505,8 +2576,10 @@ def main():
                         help='Disable inheritance of personnummer from previous pages')
     parser.add_argument('--no-autocorrect', action='store_true',
                         help='Disable automatic correction of single-digit OCR errors')
-    parser.add_argument('--no-scb-names', action='store_true',  # RENAMED from --no-json-names
+    parser.add_argument('--no-scb-names', action='store_true',
                         help='Disable using SCB Swedish name lists for OCR enhancement and validation')
+    parser.add_argument('--no-pnr-patterns', action='store_true',  # NEW
+                        help='Disable personnummer pattern hints for OCR (may reduce ID number recognition)')
 
     args = parser.parse_args()
 
@@ -2534,7 +2607,7 @@ def main():
     # Process the PDF
     data = process_pdf(args.pdf_file, verbosity, args.jobs, args.include_invalid, 
                       not args.no_inheritance, not args.no_autocorrect, 
-                      not args.no_scb_names)  # RENAMED
+                      not args.no_scb_names, not args.no_pnr_patterns)  # NEW parameter
 
     # Output CSV
     csv_writer = csv.writer(sys.stdout)
