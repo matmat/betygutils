@@ -286,15 +286,30 @@ def create_scb_names_dictionary(first_names_set, last_names_set, verbosity=0):
         return None
 
 def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, verbosity=0):
-    """Check if names should be swapped based on name list membership."""
+    """Check if names should be swapped based on name list membership.
+
+    Will NOT swap if both names appear in both lists (both arrangements valid).
+    """
     if not efternamn or not fornamn:
         return efternamn, fornamn, False
 
-    # Check the specific swap condition:
-    # fornamn exists in last_names_set AND efternamn exists in first_names_set
+    # Check where each name appears
+    fornamn_in_first = fornamn in first_names_set
     fornamn_in_last = fornamn in last_names_set
     efternamn_in_first = efternamn in first_names_set
+    efternamn_in_last = efternamn in last_names_set
 
+    # Check if BOTH names appear in BOTH lists
+    # If so, both arrangements are valid - don't swap
+    if (fornamn_in_first and fornamn_in_last and 
+        efternamn_in_first and efternamn_in_last):
+        if verbosity > 1:
+            print(f"    NO SWAP: '{efternamn}, {fornamn}' - both names appear in both lists "
+                  f"(both arrangements valid)", file=sys.stderr)
+        return efternamn, fornamn, False
+
+    # Original swap condition:
+    # fornamn exists in last_names_set AND efternamn exists in first_names_set
     if fornamn_in_last and efternamn_in_first:
         if verbosity > 1:
             print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
