@@ -1219,15 +1219,18 @@ def parse_name_from_text(text, config, verbosity=0):
     2. Handle commas (keep rightmost if multiple)
     3. Split on comma or space
     4. DISCARD if only one name part found after splitting
+
+    Returns:
+        Tuple of (efternamn, fornamn, is_comma_separated) - NEW: added comma indicator
     """
     if not text or not text.strip():
-        return None, None
+        return None, None, False
 
     # Apply the new cleaning FIRST
     text = clean_name_candidate(text, config, verbosity)
 
     if not text:
-        return None, None
+        return None, None, False
 
     # Remove leading/trailing commas
     text = text.strip(',').strip()
@@ -1272,7 +1275,7 @@ def parse_name_from_text(text, config, verbosity=0):
                         print(f"    DISCARDING: Only efternamn '{efternamn}' found after splitting - discarding entire name", file=sys.stderr)
                     else:
                         print(f"    DISCARDING: Only fornamn '{fornamn}' found after splitting - discarding entire name", file=sys.stderr)
-                return "", ""
+                return "", "", False
 
             # Log if cleaning or merging changed the names (in very verbose mode)
             if verbosity > 1:
@@ -1296,15 +1299,15 @@ def parse_name_from_text(text, config, verbosity=0):
 
                     print(f"    Name processing (comma-separated): {'; '.join(changes)}", file=sys.stderr)
 
-            return efternamn, fornamn
-        return None, None
+            return efternamn, fornamn, True  # TRUE indicates comma-separated
+        return None, None, False
 
     else:
         # Space-separated format - use heuristic splitting
         cleaned_text = clean_name(text, config)
 
         if not cleaned_text:
-            return None, None
+            return None, None, False
 
         words = cleaned_text.split()
         if len(words) >= 2:
@@ -1342,7 +1345,7 @@ def parse_name_from_text(text, config, verbosity=0):
                             print(f"    DISCARDING: Only efternamn '{efternamn}' found after splitting - discarding entire name", file=sys.stderr)
                         else:
                             print(f"    DISCARDING: Only fornamn '{fornamn}' found after splitting - discarding entire name", file=sys.stderr)
-                    return "", ""
+                    return "", "", False
 
                 if verbosity > 1:
                     if processed_words != words:
@@ -1352,19 +1355,19 @@ def parse_name_from_text(text, config, verbosity=0):
                         print(f"    Name processing (space-separated): '{text}' → cleaned: '{cleaned_text}' → '{efternamn}, {fornamn}'", 
                               file=sys.stderr)
 
-                return efternamn, fornamn
+                return efternamn, fornamn, False  # FALSE indicates space-separated
             elif len(processed_words) == 1:
                 # After processing, only one word left - can't split into efternamn/fornamn
                 if verbosity > 1:
                     print(f"    Name processing (space-separated): '{text}' → only one word after processing: '{processed_words[0]}' - discarding", 
                           file=sys.stderr)
-                return "", ""
+                return "", "", False
         elif len(words) == 1:
             # Only one word - discard the name
             if verbosity > 1:
                 print(f"    Name processing: Only one word '{words[0]}' found - discarding entire name", file=sys.stderr)
-            return "", ""
-        return None, None
+            return "", "", False
+        return None, None, False
 
 def _process_inheritance_with_hole_filling(
     current_page_entries: Dict[int, List[Dict]], 
@@ -1849,11 +1852,11 @@ def _extract_names_from_same_line(
     config: Config, 
     verbosity: int, 
     match_info: Optional[Dict[str, Any]] = None
-) -> Tuple[str, str]:
+) -> Tuple[str, str, bool]:  # NEW: Return comma indicator
     """Extract names from the same line as personnummer.
 
     Returns:
-        Tuple of (efternamn, fornamn) or ("", "") if not found
+        Tuple of (efternamn, fornamn, is_comma_separated) or ("", "", False) if not found
     """
     # Find personnummer position - use match info if available
     pnr_pos = -1
@@ -1876,13 +1879,13 @@ def _extract_names_from_same_line(
     prefix = line[:pnr_pos].strip() if pnr_pos > 0 else ""
 
     if prefix:
-        efternamn, fornamn = parse_name_from_text(prefix, config, verbosity)
+        efternamn, fornamn, is_comma = parse_name_from_text(prefix, config, verbosity)
         if verbosity > 1 and efternamn:
-            format_type = "comma" if ',' in prefix else "space"
+            format_type = "comma" if is_comma else "space"
             print(f"    Found name on same line ({format_type}): {efternamn}, {fornamn}", file=sys.stderr)
-        return efternamn, fornamn
+        return efternamn, fornamn, is_comma
 
-    return "", ""
+    return "", "", False
 
 
 def _search_previous_lines_for_names(
@@ -1890,11 +1893,11 @@ def _search_previous_lines_for_names(
     start_idx: int, 
     config: Config, 
     verbosity: int
-) -> Tuple[str, str]:
+) -> Tuple[str, str, bool]:  # NEW: Return comma indicator
     """Search previous lines for names.
 
     Returns:
-        Tuple of (efternamn, fornamn) or ("", "") if not found
+        Tuple of (efternamn, fornamn, is_comma_separated) or ("", "", False) if not found
     """
     pattern = config.personnummer_pattern
     found_lines = []
@@ -1941,15 +1944,15 @@ def _search_previous_lines_for_names(
         else:
             combined_line = found_lines[0]
 
-        efternamn, fornamn = parse_name_from_text(combined_line, config, verbosity)
+        efternamn, fornamn, is_comma = parse_name_from_text(combined_line, config, verbosity)
 
         if efternamn and verbosity > 1:
             lines_back = start_idx - lines.index(found_lines[-1])
             print(f"    Found name {lines_back} lines above: {efternamn}, {fornamn}", file=sys.stderr)
 
-        return efternamn, fornamn
+        return efternamn, fornamn, is_comma
 
-    return "", ""
+    return "", "", False
 
 
 def _find_personnummer_with_regex(
@@ -2294,41 +2297,16 @@ def extract_names_for_personnummer(
     """Extract names for a specific selected personnummer with name swapping check."""
     lines = text.split('\n')
 
-    # Step 1: Try same line extraction
-    efternamn, fornamn = _extract_names_from_same_line(
+    # Step 1: Try same line extraction (now returns comma indicator)
+    efternamn, fornamn, is_comma_separated = _extract_names_from_same_line(
         lines[selected_line_idx], selected_pnr, config, verbosity, match_info
     )
 
-    # Track if names came from comma-separated format
-    is_comma_separated = False
-    if efternamn or fornamn:
-        # Check if the line had a comma before the personnummer position
-        line = lines[selected_line_idx]
-        pnr_pos = match_info.get('match_start') if match_info else line.find(selected_pnr)
-        if pnr_pos > 0:
-            prefix = line[:pnr_pos]
-            if ',' in prefix:
-                is_comma_separated = True
-
     if not efternamn:
-        # Step 2: Search previous lines
-        efternamn, fornamn = _search_previous_lines_for_names(
+        # Step 2: Search previous lines (now returns comma indicator)
+        efternamn, fornamn, is_comma_separated = _search_previous_lines_for_names(
             lines, selected_line_idx, config, verbosity
         )
-
-        # Check if these names came from comma-separated format
-        if efternamn or fornamn:
-            # Look back to find the source lines and check for comma
-            for prev_idx in range(selected_line_idx - 1, -1, -1):
-                prev_line = lines[prev_idx].strip()
-                if not prev_line:
-                    continue
-                if ',' in prev_line:
-                    is_comma_separated = True
-                    break
-                # If we found a line with content but no comma, it's space-separated
-                if prev_line and not should_filter_line(prev_line, config):
-                    break
 
     # NEW: Capitalize first letter if lowercase AND name not in SCB lists
     # This is done AFTER splitting but BEFORE swapping
@@ -2367,7 +2345,8 @@ def extract_names_for_personnummer(
                     list_info.append("last names")
                 print(f"    Not capitalizing efternamn '{efternamn}' - found in SCB {' and '.join(list_info)} list", file=sys.stderr)
 
-    # Check if names should be swapped - ONLY FOR SPACE-SEPARATED NAMES
+    # CRITICAL FIX: Check if names should be swapped - ONLY FOR SPACE-SEPARATED NAMES
+    # The is_comma_separated flag now correctly indicates if names came from comma format
     if config.use_scb_names and efternamn and fornamn and not is_comma_separated:
         if verbosity > 1:
             print(f"    Checking swap for space-separated names: '{efternamn}, {fornamn}'", file=sys.stderr)
@@ -2377,7 +2356,7 @@ def extract_names_for_personnummer(
             verbosity
         )
     elif is_comma_separated and verbosity > 1:
-        print(f"    NO SWAP CHECK: Comma-separated format - assuming '{efternamn}' is last name, '{fornamn}' is first name", file=sys.stderr)
+        print(f"    NO SWAP CHECK: Comma-separated format detected - preserving order '{efternamn}' (last), '{fornamn}' (first)", file=sys.stderr)
 
     return efternamn, fornamn
 
