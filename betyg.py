@@ -747,10 +747,10 @@ def clean_name(name, config):
     # Strip leading and trailing whitespace
     cleaned = cleaned.strip()
 
-    # Strip leading and trailing punctuation (except legitimate name enders)
-    # Keep trailing period (for Jr. Sr. etc)
+    # Remove ALL leading and trailing punctuation (no exceptions)
+    # This will remove periods, commas, exclamation marks, pipes, etc.
     cleaned = re.sub(r'^[^\w\s]+', '', cleaned)  # Remove leading punctuation
-    cleaned = re.sub(r'[^\w\s.]+$', '', cleaned)  # Remove trailing punct except period
+    cleaned = re.sub(r'[^\w\s]+$', '', cleaned)  # Remove ALL trailing punctuation
 
     return cleaned
 
