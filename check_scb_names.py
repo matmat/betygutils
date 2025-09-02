@@ -171,20 +171,21 @@ def load_or_fetch_name_lists(force_refresh=False, verbosity=0):
     return first_names, last_names
 
 
-def check_csv_file(
+def collect_names_from_csv(
     csv_path: Path, 
-    first_names: Set[str], 
-    last_names: Set[str], 
     fornamn_field: str, 
-    efternamn_field: str, 
+    efternamn_field: str,
+    check_fornamn: bool,
+    check_efternamn: bool,
     verbosity: int
-) -> List[Dict]:
-    """Check a CSV file for names not in SCB lists.
+) -> Tuple[Set[str], Set[str]]:
+    """Collect unique förnamn and efternamn from a CSV file.
 
     Returns:
-        List of dictionaries with non-matching entries
+        Tuple of (förnamn_set, efternamn_set)
     """
-    non_matching = []
+    fornamn_set = set()
+    efternamn_set = set()
 
     try:
         with open(csv_path, 'r', encoding='utf-8') as f:
@@ -193,45 +194,27 @@ def check_csv_file(
             # Check if required fields exist
             if reader.fieldnames is None:
                 print(f"Error: No header found in {csv_path}", file=sys.stderr)
-                return []
+                return fornamn_set, efternamn_set
 
-            if fornamn_field not in reader.fieldnames:
+            if check_fornamn and fornamn_field not in reader.fieldnames:
                 print(f"Error: Field '{fornamn_field}' not found in {csv_path}. Available fields: {', '.join(reader.fieldnames)}", file=sys.stderr)
-                return []
+                return fornamn_set, efternamn_set
 
-            if efternamn_field not in reader.fieldnames:
+            if check_efternamn and efternamn_field not in reader.fieldnames:
                 print(f"Error: Field '{efternamn_field}' not found in {csv_path}. Available fields: {', '.join(reader.fieldnames)}", file=sys.stderr)
-                return []
+                return fornamn_set, efternamn_set
 
             # Process each row
-            for row_num, row in enumerate(reader, start=2):  # Start at 2 (1 is header)
-                fornamn = row.get(fornamn_field, '').strip()
-                efternamn = row.get(efternamn_field, '').strip()
+            for row in reader:
+                if check_fornamn:
+                    fornamn = row.get(fornamn_field, '').strip()
+                    if fornamn:
+                        fornamn_set.add(fornamn)
 
-                # Skip empty names
-                if not fornamn and not efternamn:
-                    continue
-
-                # Check names against SCB lists
-                fornamn_not_found = False
-                efternamn_not_found = False
-
-                if fornamn and fornamn not in first_names:
-                    fornamn_not_found = True
-
-                if efternamn and efternamn not in last_names:
-                    efternamn_not_found = True
-
-                # Only include if at least one name is not in the lists
-                if fornamn_not_found or efternamn_not_found:
-                    non_matching.append({
-                        'row_num': row_num,
-                        'row_data': row,
-                        'fornamn': fornamn,
-                        'efternamn': efternamn,
-                        'fornamn_not_found': fornamn_not_found,
-                        'efternamn_not_found': efternamn_not_found
-                    })
+                if check_efternamn:
+                    efternamn = row.get(efternamn_field, '').strip()
+                    if efternamn:
+                        efternamn_set.add(efternamn)
 
     except FileNotFoundError:
         print(f"Error: File not found: {csv_path}", file=sys.stderr)
@@ -240,17 +223,7 @@ def check_csv_file(
     except Exception as e:
         print(f"Error reading {csv_path}: {e}", file=sys.stderr)
 
-    return non_matching
-
-
-def format_csv_row(row: Dict[str, str], delimiter: str = ',') -> str:
-    """Format a CSV row dictionary as a CSV line."""
-    # Create a CSV writer that writes to a string
-    import io
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=row.keys(), lineterminator='')
-    writer.writerow(row)
-    return output.getvalue()
+    return fornamn_set, efternamn_set
 
 
 def main():
@@ -264,16 +237,40 @@ def main():
                         help='Name of the first name field in CSV (default: fornamn)')
     parser.add_argument('--efternamn-field', default='efternamn',
                         help='Name of the last name field in CSV (default: efternamn)')
+
+    # Name type selection
+    name_group = parser.add_mutually_exclusive_group()
+    name_group.add_argument('-f', '--fornamn-only', action='store_true',
+                           help='Check only förnamn')
+    name_group.add_argument('-e', '--efternamn-only', action='store_true',
+                           help='Check only efternamn')
+
+    # Prefix control
+    parser.add_argument('--no-prefix', action='store_true',
+                        help='Do not show F:/E: prefixes (only allowed when checking one type)')
+
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Verbose output')
     parser.add_argument('-q', '--quiet', action='store_true',
-                        help='Quiet mode (only output non-matching lines)')
+                        help='Quiet mode (only output non-matching names)')
     parser.add_argument('--refresh-cache', action='store_true',
                         help='Force refresh of SCB name lists from API')
     parser.add_argument('--show-fields', action='store_true',
                         help='Show all CSV fields and exit')
 
     args = parser.parse_args()
+
+    # Determine what to check
+    check_fornamn = not args.efternamn_only
+    check_efternamn = not args.fornamn_only
+
+    # Validate prefix option
+    if args.no_prefix and check_fornamn and check_efternamn:
+        print("Error: --no-prefix can only be used when checking either förnamn or efternamn, not both", file=sys.stderr)
+        sys.exit(1)
+
+    # Determine if we should show prefixes
+    show_prefix = not args.no_prefix if (check_fornamn != check_efternamn) else True
 
     # Set verbosity
     if args.quiet:
@@ -304,17 +301,18 @@ def main():
         sys.exit(0)
 
     # Load SCB name lists
-    first_names, last_names = load_or_fetch_name_lists(
+    first_names_scb, last_names_scb = load_or_fetch_name_lists(
         force_refresh=args.refresh_cache,
         verbosity=verbosity
     )
 
-    if not first_names and not last_names:
+    if not first_names_scb and not last_names_scb:
         print("Error: Could not load SCB name lists", file=sys.stderr)
         sys.exit(1)
 
-    # Process each CSV file
-    total_non_matching = 0
+    # Collect all unique names from CSV files
+    all_fornamn = set()
+    all_efternamn = set()
 
     for csv_path in args.csv_files:
         if not csv_path.exists():
@@ -322,53 +320,63 @@ def main():
             continue
 
         if verbosity >= 0:
-            print(f"\nChecking {csv_path}...", file=sys.stderr)
+            print(f"Processing {csv_path}...", file=sys.stderr)
 
-        # Check the CSV file
-        non_matching = check_csv_file(
+        fornamn, efternamn = collect_names_from_csv(
             csv_path,
-            first_names,
-            last_names,
             args.fornamn_field,
             args.efternamn_field,
+            check_fornamn,
+            check_efternamn,
             verbosity
         )
 
-        # Output results for this file
-        if non_matching:
-            if verbosity >= 0:
-                print(f"Found {len(non_matching)} rows with names not in SCB lists:", file=sys.stderr)
+        all_fornamn.update(fornamn)
+        all_efternamn.update(efternamn)
 
-            for entry in non_matching:
-                # Output the full CSV row
-                print(format_csv_row(entry['row_data']))
+    # Find names not in SCB lists
+    missing_fornamn = all_fornamn - first_names_scb if check_fornamn else set()
+    missing_efternamn = all_efternamn - last_names_scb if check_efternamn else set()
 
-                # Output indented information about which names are not present
-                issues = []
-                if entry['fornamn_not_found']:
-                    if entry['fornamn']:
-                        issues.append(f"förnamn '{entry['fornamn']}' not in SCB list")
-                    else:
-                        issues.append("förnamn is empty")
+    # Prepare output list with prefixes
+    output_names = []
 
-                if entry['efternamn_not_found']:
-                    if entry['efternamn']:
-                        issues.append(f"efternamn '{entry['efternamn']}' not in SCB list")
-                    else:
-                        issues.append("efternamn is empty")
+    if check_fornamn:
+        for name in missing_fornamn:
+            if show_prefix:
+                output_names.append(('F', name))
+            else:
+                output_names.append(('', name))
 
-                if issues:
-                    print(f"  → Row {entry['row_num']}: {'; '.join(issues)}")
+    if check_efternamn:
+        for name in missing_efternamn:
+            if show_prefix:
+                output_names.append(('E', name))
+            else:
+                output_names.append(('', name))
 
-            total_non_matching += len(non_matching)
+    # Sort by name (not prefix)
+    output_names.sort(key=lambda x: x[1])
+
+    # Output results
+    if verbosity >= 0:
+        missing_count = len(missing_fornamn) + len(missing_efternamn)
+        if missing_count > 0:
+            parts = []
+            if check_fornamn and missing_fornamn:
+                parts.append(f"{len(missing_fornamn)} förnamn")
+            if check_efternamn and missing_efternamn:
+                parts.append(f"{len(missing_efternamn)} efternamn")
+            print(f"Found {' and '.join(parts)} not in SCB lists", file=sys.stderr)
         else:
-            if verbosity >= 0:
-                print(f"All names in {csv_path} are present in SCB lists", file=sys.stderr)
+            print("All names found in SCB lists", file=sys.stderr)
 
-    # Summary
-    if verbosity >= 0 and len(args.csv_files) > 1:
-        print(f"\nTotal: {total_non_matching} rows with names not in SCB lists across {len(args.csv_files)} files", 
-              file=sys.stderr)
+    # Print the names
+    for prefix, name in output_names:
+        if prefix:
+            print(f"{prefix}:{name}")
+        else:
+            print(name)
 
 
 if __name__ == '__main__':
