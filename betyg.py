@@ -904,7 +904,7 @@ def clean_name_candidate(text, config, verbosity=0):
     - One/two-letter words: can clean from both leading and trailing
     - Three-letter words: can clean from trailing only
     - Stop cleaning from an end when unclearable word is found
-    - Never clean SCB names or allowed words
+    - Never clean SCB names or allowed words (case-SENSITIVE check)
     """
     if not text or not text.strip():
         return ""
@@ -940,10 +940,10 @@ def clean_name_candidate(text, config, verbosity=0):
     text_after_preprocessing = text
     # === END OF NEW PREPROCESSING STEP ===
 
-    # Get SCB names for checking
+    # Get SCB names for checking - NO LONGER LOWERCASING (for case-sensitive check)
     scb_names = set()
     if config.use_scb_names:
-        scb_names = set(n.lower() for n in config.first_names_set) | set(n.lower() for n in config.last_names_set)
+        scb_names = config.first_names_set | config.last_names_set
 
     # Allowed words that should NOT be cleaned
     allowed_one_letter_words = {}
@@ -961,15 +961,15 @@ def clean_name_candidate(text, config, verbosity=0):
         if word_len > 3:
             return False, f"word length {word_len} > 3"
 
-        # Never clean SCB names
-        if word_lower in scb_names:
+        # Never clean SCB names - CASE-SENSITIVE CHECK
+        if word in scb_names:
             # Determine if it's a first name or last name
-            if word in config.first_names_set or word.capitalize() in config.first_names_set:
-                return False, "appears in SCB first names list"
-            elif word in config.last_names_set or word.capitalize() in config.last_names_set:
-                return False, "appears in SCB last names list"
+            if word in config.first_names_set:
+                return False, "appears in SCB first names list (case-sensitive match)"
+            elif word in config.last_names_set:
+                return False, "appears in SCB last names list (case-sensitive match)"
             else:
-                return False, "appears in SCB names list"
+                return False, "appears in SCB names list (case-sensitive match)"
 
         # Never clean allowed one-letter words
         if word_len == 1 and word_lower in allowed_one_letter_words:
