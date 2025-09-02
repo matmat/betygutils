@@ -938,7 +938,7 @@ def clean_name_candidate(text, config, verbosity=0):
         scb_names = set(n.lower() for n in config.first_names_set) | set(n.lower() for n in config.last_names_set)
 
     # Allowed words that should NOT be cleaned
-    allowed_one_letter_words = {'i', 'å', 'ä', 'ö'}
+    allowed_one_letter_words = {}
 
     def can_clean_word(word, position):
         """Check if a word can be cleaned based on all rules."""
