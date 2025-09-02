@@ -425,6 +425,14 @@ def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, ve
                   f"(both arrangements valid)", file=sys.stderr)
         return efternamn, fornamn, False
 
+    # NEW CONDITION: If fornamn is in last_names_set BUT efternamn is NOT in first_names_set
+    # This is enough to trigger a swap
+    if fornamn_in_last and not efternamn_in_first:
+        if verbosity > 1:
+            print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
+                  f"(fornamn found in last names, efternamn NOT in first names)", file=sys.stderr)
+        return fornamn, efternamn, True
+
     # Original swap condition:
     # fornamn exists in last_names_set AND efternamn exists in first_names_set
     if fornamn_in_last and efternamn_in_first:
