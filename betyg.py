@@ -2859,74 +2859,63 @@ def extract_all_data(page_texts, config, verbosity, include_invalid):
     return all_data
 
 
-def find_autocorrection_candidate(invalid_pnr, efternamn, fornamn, valid_entries, verbosity=0):
-    """Find a valid personnummer that could be an autocorrection target."""
-
-    # Condition 1: Both names must be present
+def find_autocorrection_candidate(invalid_pnr, efternamn, fornamn, valid_entries, verbosity):
+    """
+    Find a valid personnummer that differs by exactly one digit from the invalid one.
+    Now with detailed debug output when verbosity > 2 (-vvv flag).
+    """
+    # Check condition 1: Both names must be present
     if not efternamn or not fornamn:
-        if verbosity > 1:
-            print(f"    Autocorrect eval for {invalid_pnr}: CONDITION 1 FAILED - missing names (efternamn='{efternamn}', fornamn='{fornamn}')", 
-                  file=sys.stderr)
+        if verbosity > 2:
+            print(f"    Evaluating {invalid_pnr} for {efternamn}, {fornamn}:", file=sys.stderr)
+            print(f"      CONDITION 1 FAILED - missing name(s)", file=sys.stderr)
         return None
 
-    if verbosity > 1:
-        print(f"    Autocorrect eval for {invalid_pnr} ({efternamn}, {fornamn}):", file=sys.stderr)
-        print(f"      CONDITION 1 PASSED - both names present", file=sys.stderr)
-
-    # Condition 2: Look for exact name matches among valid entries
-    name_matches = [
-        entry for entry in valid_entries 
-        if entry['efternamn'] == efternamn and entry['fornamn'] == fornamn
+    # Find all entries with matching names (case-insensitive)
+    matching_entries = [
+        entry for entry in valid_entries
+        if entry['efternamn'].lower() == efternamn.lower()
+        and entry['fornamn'].lower() == fornamn.lower()
     ]
 
-    if not name_matches:
-        if verbosity > 1:
-            print(f"      CONDITION 2 FAILED - no exact name match found among {len(valid_entries)} valid entries", 
-                  file=sys.stderr)
+    # Check condition 2: Must have at least one matching name entry
+    if not matching_entries:
+        if verbosity > 2:
+            print(f"    Evaluating {invalid_pnr} for {efternamn}, {fornamn}:", file=sys.stderr)
+            print(f"      CONDITION 1 PASSED - both names present", file=sys.stderr)
+            print(f"      CONDITION 2 FAILED - no matching names found", file=sys.stderr)
         return None
 
-    if verbosity > 1:
-        print(f"      CONDITION 2 PASSED - found {len(name_matches)} exact name matches", file=sys.stderr)
+    # Check each matching entry to find one that differs by exactly one digit
+    for candidate_entry in matching_entries:
+        candidate_pnr = candidate_entry['personnummer']
 
-    # Check conditions 3 and 4 for each match
-    for i, candidate in enumerate(name_matches):
-        valid_pnr = candidate['personnummer']
+        if verbosity > 2:
+            print(f"    Evaluating {invalid_pnr} for {efternamn}, {fornamn}:", file=sys.stderr)
+            print(f"      CONDITION 1 PASSED - both names present", file=sys.stderr)
+            print(f"      CONDITION 2 PASSED - found {len(matching_entries)} matching name(s)", file=sys.stderr)
+            print(f"      Checking candidate: {candidate_pnr}", file=sys.stderr)
 
-        if verbosity > 1:
-            print(f"      Checking candidate #{i+1}: {valid_pnr}", file=sys.stderr)
-
-        # Condition 3: Match must be valid (implicit since it's from valid_entries)
-        if verbosity > 1:
+        # Check condition 3: Candidate must be from valid entries (always true here by design)
+        if verbosity > 2:
             print(f"        CONDITION 3 PASSED - candidate is from valid entries list", file=sys.stderr)
 
-        # Condition 4: Exactly one digit difference
-        if has_single_digit_difference(invalid_pnr, valid_pnr):
-            if verbosity > 1:
-                # Find and show the specific difference
-                clean_invalid = invalid_pnr.replace('-', '')
-                clean_valid = valid_pnr.replace('-', '')
-                for pos, (c1, c2) in enumerate(zip(clean_invalid, clean_valid)):
-                    if c1 != c2:
-                        print(f"        CONDITION 4 PASSED - exactly 1 digit difference at position {pos}: '{c1}' vs '{c2}'", 
-                              file=sys.stderr)
-                        break
-                print(f"      ✓ ALL CONDITIONS MET - returning {valid_pnr} as correction", file=sys.stderr)
-            return valid_pnr
-        else:
-            if verbosity > 1:
-                # Count and show differences
-                clean_invalid = invalid_pnr.replace('-', '')
-                clean_valid = valid_pnr.replace('-', '')
-                if len(clean_invalid) != len(clean_valid):
-                    print(f"        CONDITION 4 FAILED - different lengths ({len(clean_invalid)} vs {len(clean_valid)})", 
-                          file=sys.stderr)
-                else:
-                    differences = sum(1 for c1, c2 in zip(clean_invalid, clean_valid) if c1 != c2)
-                    print(f"        CONDITION 4 FAILED - {differences} digit differences (need exactly 1)", 
-                          file=sys.stderr)
+        # Check condition 4: Exactly one digit difference
+        if len(invalid_pnr) != len(candidate_pnr):
+            if verbosity > 2:
+                print(f"        CONDITION 4 FAILED - different lengths ({len(invalid_pnr)} vs {len(candidate_pnr)})", file=sys.stderr)
+            continue
 
-    if verbosity > 1:
-        print(f"      No candidates met all 4 conditions", file=sys.stderr)
+        differences = sum(1 for a, b in zip(invalid_pnr, candidate_pnr) if a != b)
+
+        if differences == 1:
+            if verbosity > 2:
+                print(f"        CONDITION 4 PASSED - exactly 1 digit difference", file=sys.stderr)
+                print(f"        ✓ ALL CONDITIONS MET - autocorrection found!", file=sys.stderr)
+            return candidate_pnr
+        else:
+            if verbosity > 2:
+                print(f"        CONDITION 4 FAILED - {differences} digit differences (need exactly 1)", file=sys.stderr)
 
     return None
 
@@ -2953,7 +2942,7 @@ def apply_single_correction(entry, valid_entries, verbosity):
     pnr_to_check = entry.get('original_pnr', entry['personnummer'])
 
     if not pnr_to_check:
-        if verbosity > 1:
+        if verbosity > 2:
             print(f"    Autocorrect: No personnummer to check for page {entry.get('page', '?')}", 
                   file=sys.stderr)
         return False
