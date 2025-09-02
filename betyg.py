@@ -2308,42 +2308,64 @@ def extract_names_for_personnummer(
             lines, selected_line_idx, config, verbosity
         )
 
-    # NEW: Capitalize first letter if lowercase AND name not in SCB lists
+    # NEW: Capitalize first letter if lowercase AND it makes the name found in SCB lists
     # This is done AFTER splitting but BEFORE swapping
     if config.use_scb_names and (config.first_names_set or config.last_names_set):
-        # Check and capitalize fornamn
+        # Check and potentially capitalize fornamn
         if fornamn and len(fornamn) > 0 and fornamn[0].islower():
-            # Check if fornamn is NOT in either SCB list
+            # Check if lowercase fornamn is NOT in either SCB list
             if fornamn not in config.first_names_set and fornamn not in config.last_names_set:
+                # Create capitalized version
                 capitalized_fornamn = fornamn[0].upper() + fornamn[1:] if len(fornamn) > 1 else fornamn.upper()
-                if verbosity > 1:
-                    print(f"    Capitalized fornamn: '{fornamn}' → '{capitalized_fornamn}' (not in SCB lists)", file=sys.stderr)
-                fornamn = capitalized_fornamn
+
+                # Check if capitalized version IS in either SCB list
+                if capitalized_fornamn in config.first_names_set or capitalized_fornamn in config.last_names_set:
+                    if verbosity > 1:
+                        list_info = []
+                        if capitalized_fornamn in config.first_names_set:
+                            list_info.append("first names")
+                        if capitalized_fornamn in config.last_names_set:
+                            list_info.append("last names")
+                        print(f"    Capitalized fornamn: '{fornamn}' → '{capitalized_fornamn}' (capitalized version found in SCB {' and '.join(list_info)} list)", file=sys.stderr)
+                    fornamn = capitalized_fornamn
+                elif verbosity > 1:
+                    print(f"    Not capitalizing fornamn '{fornamn}' - capitalized version '{capitalized_fornamn}' also not in SCB lists", file=sys.stderr)
             elif verbosity > 1:
-                # Name found in lists but starts with lowercase
+                # Lowercase name already found in lists
                 list_info = []
                 if fornamn in config.first_names_set:
                     list_info.append("first names")
                 if fornamn in config.last_names_set:
                     list_info.append("last names")
-                print(f"    Not capitalizing fornamn '{fornamn}' - found in SCB {' and '.join(list_info)} list", file=sys.stderr)
+                print(f"    Not capitalizing fornamn '{fornamn}' - already found in SCB {' and '.join(list_info)} list", file=sys.stderr)
 
-        # Check and capitalize efternamn
+        # Check and potentially capitalize efternamn
         if efternamn and len(efternamn) > 0 and efternamn[0].islower():
-            # Check if efternamn is NOT in either SCB list
+            # Check if lowercase efternamn is NOT in either SCB list
             if efternamn not in config.first_names_set and efternamn not in config.last_names_set:
+                # Create capitalized version
                 capitalized_efternamn = efternamn[0].upper() + efternamn[1:] if len(efternamn) > 1 else efternamn.upper()
-                if verbosity > 1:
-                    print(f"    Capitalized efternamn: '{efternamn}' → '{capitalized_efternamn}' (not in SCB lists)", file=sys.stderr)
-                efternamn = capitalized_efternamn
+
+                # Check if capitalized version IS in either SCB list
+                if capitalized_efternamn in config.first_names_set or capitalized_efternamn in config.last_names_set:
+                    if verbosity > 1:
+                        list_info = []
+                        if capitalized_efternamn in config.first_names_set:
+                            list_info.append("first names")
+                        if capitalized_efternamn in config.last_names_set:
+                            list_info.append("last names")
+                        print(f"    Capitalized efternamn: '{efternamn}' → '{capitalized_efternamn}' (capitalized version found in SCB {' and '.join(list_info)} list)", file=sys.stderr)
+                    efternamn = capitalized_efternamn
+                elif verbosity > 1:
+                    print(f"    Not capitalizing efternamn '{efternamn}' - capitalized version '{capitalized_efternamn}' also not in SCB lists", file=sys.stderr)
             elif verbosity > 1:
-                # Name found in lists but starts with lowercase
+                # Lowercase name already found in lists
                 list_info = []
                 if efternamn in config.first_names_set:
                     list_info.append("first names")
                 if efternamn in config.last_names_set:
                     list_info.append("last names")
-                print(f"    Not capitalizing efternamn '{efternamn}' - found in SCB {' and '.join(list_info)} list", file=sys.stderr)
+                print(f"    Not capitalizing efternamn '{efternamn}' - already found in SCB {' and '.join(list_info)} list", file=sys.stderr)
 
     # CRITICAL FIX: Check if names should be swapped - ONLY FOR SPACE-SEPARATED NAMES
     # The is_comma_separated flag now correctly indicates if names came from comma format
