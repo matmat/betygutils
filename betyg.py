@@ -949,39 +949,51 @@ def clean_name_candidate(text, config, verbosity=0):
     allowed_one_letter_words = {}
 
     def can_clean_word(word, position):
-        """Check if a word can be cleaned based on all rules."""
+        """Check if a word can be cleaned based on all rules.
+
+        Returns:
+            tuple: (can_clean: bool, reason: str) - reason explains why word cannot be cleaned
+        """
         word_lower = word.lower()
         word_len = len(word)
 
         # Never clean words 4+ letters
         if word_len > 3:
-            return False
+            return False, f"word length {word_len} > 3"
 
         # Never clean SCB names
         if word_lower in scb_names:
-            return False
+            # Determine if it's a first name or last name
+            if word in config.first_names_set or word.capitalize() in config.first_names_set:
+                return False, "appears in SCB first names list"
+            elif word in config.last_names_set or word.capitalize() in config.last_names_set:
+                return False, "appears in SCB last names list"
+            else:
+                return False, "appears in SCB names list"
 
         # Never clean allowed one-letter words
         if word_len == 1 and word_lower in allowed_one_letter_words:
-            return False
+            return False, "allowed one-letter word"
 
         # Never clean allowed two-letter words
         if word_len == 2 and word_lower in config.allowed_two_letter_words:
-            return False
+            return False, f"allowed two-letter word (in config.allowed_two_letter_words)"
 
         # Three-letter words can only be cleaned from trailing position
         if word_len == 3:
             if position == 'leading':
-                return False
+                return False, "three-letter word in leading position (can only clean from trailing)"
             # Check if it's in allowed trailing three-letter words
             if word_lower in config.allowed_trailing_three_letter_words:
-                return False
+                return False, f"allowed trailing three-letter word ('{word_lower}' in config.allowed_trailing_three_letter_words)"
 
-        return True
+        return True, ""
 
     # Iterative cleaning process
     trailing_blocked = False
     leading_blocked = False
+    trailing_block_reason = ""
+    leading_block_reason = ""
 
     while True:
         # Check word count with hyphen as word character
@@ -1003,15 +1015,17 @@ def clean_name_candidate(text, config, verbosity=0):
             words = text.split()
             if words:
                 last_word = words[-1]
-                if can_clean_word(last_word, 'trailing'):
+                can_clean, reason = can_clean_word(last_word, 'trailing')
+                if can_clean:
                     text = ' '.join(words[:-1])
                     cleaned_this_iteration = True
                     if verbosity > 1:
                         print(f"    Cleaned trailing '{last_word}' → '{text}'", file=sys.stderr)
                 else:
                     trailing_blocked = True
+                    trailing_block_reason = reason
                     if verbosity > 1:
-                        print(f"    Cannot clean trailing '{last_word}' - blocking trailing", file=sys.stderr)
+                        print(f"    Cannot clean trailing '{last_word}' - blocking trailing (reason: {reason})", file=sys.stderr)
 
         # Check word count again
         if count_words_for_cleaning(text) <= 2:
@@ -1022,15 +1036,17 @@ def clean_name_candidate(text, config, verbosity=0):
             words = text.split()
             if words:
                 first_word = words[0]
-                if can_clean_word(first_word, 'leading'):
+                can_clean, reason = can_clean_word(first_word, 'leading')
+                if can_clean:
                     text = ' '.join(words[1:])
                     cleaned_this_iteration = True
                     if verbosity > 1:
                         print(f"    Cleaned leading '{first_word}' → '{text}'", file=sys.stderr)
                 else:
                     leading_blocked = True
+                    leading_block_reason = reason
                     if verbosity > 1:
-                        print(f"    Cannot clean leading '{first_word}' - blocking leading", file=sys.stderr)
+                        print(f"    Cannot clean leading '{first_word}' - blocking leading (reason: {reason})", file=sys.stderr)
 
         # If nothing was cleaned in this iteration, stop
         if not cleaned_this_iteration:
