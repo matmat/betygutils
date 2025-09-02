@@ -2949,8 +2949,17 @@ def has_single_digit_difference(pnr1, pnr2):
 
 def apply_single_correction(entry, valid_entries, verbosity):
     """Apply autocorrection to a single entry if possible."""
+    # Use original_pnr for comparison (personnummer might be cleared if invalid)
+    pnr_to_check = entry.get('original_pnr', entry['personnummer'])
+
+    if not pnr_to_check:
+        if verbosity > 1:
+            print(f"    Autocorrect: No personnummer to check for page {entry.get('page', '?')}", 
+                  file=sys.stderr)
+        return False
+
     correction_candidate = find_autocorrection_candidate(
-        entry['personnummer'],
+        pnr_to_check,  # Use original_pnr instead of potentially empty personnummer
         entry['efternamn'], 
         entry['fornamn'],
         valid_entries,
@@ -2958,11 +2967,11 @@ def apply_single_correction(entry, valid_entries, verbosity):
     )
 
     if correction_candidate:
-        original_pnr = entry['personnummer']
+        original_pnr = pnr_to_check
         entry['personnummer'] = correction_candidate
         entry['luhn_valid'] = True
         entry['was_corrected'] = True
-        entry['original_pnr'] = original_pnr
+        entry['original_pnr'] = original_pnr  # Keep the actual original
 
         if verbosity > 1:
             print(f"    CORRECTED: {original_pnr} → {correction_candidate} for {entry['efternamn']}, {entry['fornamn']}", 
@@ -2982,10 +2991,12 @@ def apply_autocorrection(raw_data, verbosity):
     for entry in raw_data:
         entry.pop('all_valid_entries', None)
 
-    # Find entries that need autocorrection
+    # Find entries that need autocorrection - check using original_pnr
     invalid_entries = [
         entry for entry in raw_data 
-        if not entry['luhn_valid'] and 'TF' not in entry['personnummer']
+        if not entry['luhn_valid'] 
+        and 'TF' not in entry.get('original_pnr', entry['personnummer'])
+        and entry.get('original_pnr', entry['personnummer'])  # Must have a personnummer to correct
     ]
 
     if not invalid_entries:
