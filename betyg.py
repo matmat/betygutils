@@ -394,9 +394,9 @@ def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, ve
     """Check if names should be swapped based on name list membership and 'son/sen' ending.
 
     New logic for space-separated names:
-    - Still give slight bias to names ending in "son" and "sen" as efternamn
-    - If both names appear in both lists: do nothing (unless efternamn doesn't end with 'son/sen' but fornamn does)
-    - If neither name appears in any list: do nothing (unless fornamn ends with 'son/sen')
+    - "son/sen" bias ONLY applies if total word count is exactly 2
+    - If both names appear in both lists: do nothing (unless son/sen bias applies with 2 words)
+    - If neither name appears in any list: do nothing (unless son/sen bias applies with 2 words)
     - If one name appears in only ONE list (and the other in both): swap to satisfy the one-list name
     - If both names appear in only one list each: swap to satisfy correct placement
     """
@@ -409,9 +409,23 @@ def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, ve
     efternamn_in_first = efternamn in first_names_set
     efternamn_in_last = efternamn in last_names_set
 
-    # Check for "son/sen" ending bias
-    fornamn_ends_with_son = fornamn.lower().endswith(('son', 'sen'))
-    efternamn_ends_with_son = efternamn.lower().endswith(('son', 'sen'))
+    # Count total words in the candidate name string
+    total_words = len(efternamn.split()) + len(fornamn.split())
+
+    # Check for "son/sen" ending bias - ONLY if total words = 2
+    fornamn_ends_with_son = False
+    efternamn_ends_with_son = False
+
+    if total_words == 2:
+        fornamn_ends_with_son = fornamn.lower().endswith(('son', 'sen'))
+        efternamn_ends_with_son = efternamn.lower().endswith(('son', 'sen'))
+        if verbosity > 1 and (fornamn_ends_with_son or efternamn_ends_with_son):
+            print(f"    Son/sen bias check: Total words = {total_words} (eligible), "
+                  f"fornamn ends with son/sen: {fornamn_ends_with_son}, "
+                  f"efternamn ends with son/sen: {efternamn_ends_with_son}", file=sys.stderr)
+    elif verbosity > 1 and (fornamn.lower().endswith(('son', 'sen')) or efternamn.lower().endswith(('son', 'sen'))):
+        print(f"    Son/sen bias check: Total words = {total_words} (NOT eligible for son/sen bias - need exactly 2)", 
+              file=sys.stderr)
 
     # Count how many lists each name appears in
     fornamn_list_count = (1 if fornamn_in_first else 0) + (1 if fornamn_in_last else 0)
@@ -419,11 +433,11 @@ def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, ve
 
     # Case 1: Both names appear in both lists
     if fornamn_list_count == 2 and efternamn_list_count == 2:
-        # Check "son/sen" bias
-        if fornamn_ends_with_son and not efternamn_ends_with_son:
+        # Check "son/sen" bias ONLY if total words = 2
+        if total_words == 2 and fornamn_ends_with_son and not efternamn_ends_with_son:
             if verbosity > 1:
                 print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
-                      f"(both in both lists, but fornamn ends with 'son/sen' - strong last name indicator)", file=sys.stderr)
+                      f"(both in both lists, but fornamn ends with 'son/sen' - strong last name indicator, total words = 2)", file=sys.stderr)
             return fornamn, efternamn, True
         else:
             if verbosity > 1:
@@ -432,11 +446,11 @@ def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, ve
 
     # Case 2: Neither name appears in any list
     if fornamn_list_count == 0 and efternamn_list_count == 0:
-        # Check "son/sen" bias
-        if fornamn_ends_with_son and not efternamn_ends_with_son:
+        # Check "son/sen" bias ONLY if total words = 2
+        if total_words == 2 and fornamn_ends_with_son and not efternamn_ends_with_son:
             if verbosity > 1:
                 print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
-                      f"(neither in lists, but fornamn ends with 'son/sen' - strong last name indicator)", file=sys.stderr)
+                      f"(neither in lists, but fornamn ends with 'son/sen' - strong last name indicator, total words = 2)", file=sys.stderr)
             return fornamn, efternamn, True
         else:
             if verbosity > 1:
@@ -488,38 +502,40 @@ def check_and_swap_names(efternamn, fornamn, first_names_set, last_names_set, ve
                       f"(fornamn ONLY in first names, efternamn ONLY in last names)", file=sys.stderr)
             return efternamn, fornamn, False
         elif fornamn_in_first and efternamn_in_first:
-            # Both only in first names - check son/sen ending
-            if fornamn_ends_with_son and not efternamn_ends_with_son:
+            # Both only in first names - check son/sen ending ONLY if total words = 2
+            if total_words == 2 and fornamn_ends_with_son and not efternamn_ends_with_son:
                 if verbosity > 1:
                     print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
-                          f"(both ONLY in first names, but fornamn ends with 'son/sen')", file=sys.stderr)
+                          f"(both ONLY in first names, but fornamn ends with 'son/sen', total words = 2)", file=sys.stderr)
                 return fornamn, efternamn, True
             else:
                 if verbosity > 1:
-                    print(f"    NO SWAP: '{efternamn}, {fornamn}' - both ONLY in first names", file=sys.stderr)
+                    reason = " (son/sen bias not applicable - need exactly 2 words)" if total_words != 2 else ""
+                    print(f"    NO SWAP: '{efternamn}, {fornamn}' - both ONLY in first names{reason}", file=sys.stderr)
                 return efternamn, fornamn, False
         elif fornamn_in_last and efternamn_in_last:
-            # Both only in last names - check son/sen ending
-            if not fornamn_ends_with_son and efternamn_ends_with_son:
+            # Both only in last names - check son/sen ending ONLY if total words = 2
+            if total_words == 2 and not fornamn_ends_with_son and efternamn_ends_with_son:
                 if verbosity > 1:
                     print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
-                          f"(both ONLY in last names, but efternamn ends with 'son/sen' while fornamn doesn't)", file=sys.stderr)
+                          f"(both ONLY in last names, but efternamn ends with 'son/sen' while fornamn doesn't, total words = 2)", file=sys.stderr)
                 return fornamn, efternamn, True
             else:
                 if verbosity > 1:
-                    print(f"    NO SWAP: '{efternamn}, {fornamn}' - both ONLY in last names", file=sys.stderr)
+                    reason = " (son/sen bias not applicable - need exactly 2 words)" if total_words != 2 else ""
+                    print(f"    NO SWAP: '{efternamn}, {fornamn}' - both ONLY in last names{reason}", file=sys.stderr)
                 return efternamn, fornamn, False
 
     # Case 5: Mixed scenarios (one in one list, one in no lists OR one in two lists, one in no lists)
-    # Apply son/sen bias and simple heuristics
+    # Apply son/sen bias ONLY if total words = 2
 
     # If one name is not in any list
     if fornamn_list_count == 0 or efternamn_list_count == 0:
-        # Check son/sen ending first
-        if fornamn_ends_with_son and not efternamn_ends_with_son:
+        # Check son/sen ending first - ONLY if total words = 2
+        if total_words == 2 and fornamn_ends_with_son and not efternamn_ends_with_son:
             if verbosity > 1:
                 print(f"    SWAPPING: '{efternamn}, {fornamn}' → '{fornamn}, {efternamn}' "
-                      f"(fornamn ends with 'son/sen')", file=sys.stderr)
+                      f"(fornamn ends with 'son/sen', total words = 2)", file=sys.stderr)
             return fornamn, efternamn, True
 
         # If fornamn is only in last names, swap
