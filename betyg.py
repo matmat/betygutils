@@ -2283,11 +2283,36 @@ def extract_names_for_personnummer(
         lines[selected_line_idx], selected_pnr, config, verbosity, match_info
     )
 
+    # Track if names came from comma-separated format
+    is_comma_separated = False
+    if efternamn or fornamn:
+        # Check if the line had a comma before the personnummer position
+        line = lines[selected_line_idx]
+        pnr_pos = match_info.get('match_start') if match_info else line.find(selected_pnr)
+        if pnr_pos > 0:
+            prefix = line[:pnr_pos]
+            if ',' in prefix:
+                is_comma_separated = True
+
     if not efternamn:
         # Step 2: Search previous lines
         efternamn, fornamn = _search_previous_lines_for_names(
             lines, selected_line_idx, config, verbosity
         )
+
+        # Check if these names came from comma-separated format
+        if efternamn or fornamn:
+            # Look back to find the source lines and check for comma
+            for prev_idx in range(selected_line_idx - 1, -1, -1):
+                prev_line = lines[prev_idx].strip()
+                if not prev_line:
+                    continue
+                if ',' in prev_line:
+                    is_comma_separated = True
+                    break
+                # If we found a line with content but no comma, it's space-separated
+                if prev_line and not should_filter_line(prev_line, config):
+                    break
 
     # NEW: Capitalize first letter if lowercase AND name not in SCB lists
     # This is done AFTER splitting but BEFORE swapping
@@ -2326,13 +2351,17 @@ def extract_names_for_personnummer(
                     list_info.append("last names")
                 print(f"    Not capitalizing efternamn '{efternamn}' - found in SCB {' and '.join(list_info)} list", file=sys.stderr)
 
-    # Check if names should be swapped (if SCB names enabled)
-    if config.use_scb_names and efternamn and fornamn:
+    # Check if names should be swapped - ONLY FOR SPACE-SEPARATED NAMES
+    if config.use_scb_names and efternamn and fornamn and not is_comma_separated:
+        if verbosity > 1:
+            print(f"    Checking swap for space-separated names: '{efternamn}, {fornamn}'", file=sys.stderr)
         efternamn, fornamn, swapped = check_and_swap_names(
             efternamn, fornamn, 
             config.first_names_set, config.last_names_set, 
             verbosity
         )
+    elif is_comma_separated and verbosity > 1:
+        print(f"    NO SWAP CHECK: Comma-separated format - assuming '{efternamn}' is last name, '{fornamn}' is first name", file=sys.stderr)
 
     return efternamn, fornamn
 
