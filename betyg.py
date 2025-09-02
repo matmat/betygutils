@@ -53,7 +53,7 @@ class Config:
         # Original Scandinavian
         'af', 'av', 'de',
         # Asian Surnames/Names - Chinese (Romanized)
-        'li', 'lu', 'ma', 'wu', 'xu', 'yu', 'hu', 'he', 'qi', 'yi', 'fu', 'du', 'gu', 'su', 'ni', 'pu', 'xi',
+        'eh', 'li', 'lu', 'ma', 'wu', 'xu', 'yu', 'hu', 'he', 'qi', 'yi', 'fu', 'du', 'gu', 'su', 'ni', 'pu', 'xi',
         # Korean
         'yi', 'ko', 'no', 'so', 'ha',
         # Vietnamese  
