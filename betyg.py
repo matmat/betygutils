@@ -891,6 +891,7 @@ def clean_name_candidate(text, config, verbosity=0):
     """Clean name candidate with new iterative cleaning logic.
 
     Rules:
+    - Preprocess to remove "Eleven" and "intygas att" patterns from the left
     - Only clean if > 2 words (hyphen counts as word character)
     - One/two-letter words: can clean from both leading and trailing
     - Three-letter words: can clean from trailing only
@@ -902,6 +903,34 @@ def clean_name_candidate(text, config, verbosity=0):
 
     original_text = text
     text = text.strip()
+
+    # === NEW PREPROCESSING STEP ===
+    # Remove "Eleven" and "intygas att" patterns from the left side
+
+    # Pattern 1: "Eleven" - case insensitive, with flexible whitespace
+    eleven_pattern = re.compile(r'^.*?\bEleven\b\s*', re.IGNORECASE)
+    match = eleven_pattern.search(text)
+    if match:
+        text = text[match.end():].strip()
+        if verbosity > 1:
+            print(f"    Preprocessing: Removed 'Eleven' pattern from '{original_text}' → '{text}'", file=sys.stderr)
+
+    # Pattern 2: "intygas att" - case insensitive, with flexible whitespace between words
+    intygas_pattern = re.compile(r'^.*?\bintygas\s+att\b\s*', re.IGNORECASE)
+    match = intygas_pattern.search(text)
+    if match:
+        text = text[match.end():].strip()
+        if verbosity > 1:
+            print(f"    Preprocessing: Removed 'intygas att' pattern from '{original_text}' → '{text}'", file=sys.stderr)
+
+    # If preprocessing removed everything, return empty
+    if not text:
+        if verbosity > 1:
+            print(f"    Preprocessing removed entire string", file=sys.stderr)
+        return ""
+
+    text_after_preprocessing = text
+    # === END OF NEW PREPROCESSING STEP ===
 
     # Get SCB names for checking
     scb_names = set()
@@ -999,8 +1028,8 @@ def clean_name_candidate(text, config, verbosity=0):
         if not cleaned_this_iteration:
             break
 
-    if verbosity > 1 and text != original_text:
-        print(f"    Final cleaning result: '{original_text}' → '{text}'", file=sys.stderr)
+    if verbosity > 1 and text != text_after_preprocessing:
+        print(f"    Final cleaning result: '{text_after_preprocessing}' → '{text}'", file=sys.stderr)
 
     return text.strip()
 
