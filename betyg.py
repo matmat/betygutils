@@ -1104,6 +1104,7 @@ def parse_name_from_text(text, config, verbosity=0):
     1. Apply word cleaning
     2. Handle commas (keep rightmost if multiple)
     3. Split on comma or space
+    4. DISCARD if only one name part found after splitting
     """
     if not text or not text.strip():
         return None, None
@@ -1149,6 +1150,15 @@ def parse_name_from_text(text, config, verbosity=0):
 
             efternamn = ' '.join(processed_efternamn_words) if processed_efternamn_words else ""
             fornamn = ' '.join(processed_fornamn_words) if processed_fornamn_words else ""
+
+            # NEW: Check if only one name part exists after processing
+            if (efternamn and not fornamn) or (fornamn and not efternamn):
+                if verbosity > 1:
+                    if efternamn and not fornamn:
+                        print(f"    DISCARDING: Only efternamn '{efternamn}' found after splitting - discarding entire name", file=sys.stderr)
+                    else:
+                        print(f"    DISCARDING: Only fornamn '{fornamn}' found after splitting - discarding entire name", file=sys.stderr)
+                return "", ""
 
             # Log if cleaning or merging changed the names (in very verbose mode)
             if verbosity > 1:
@@ -1211,6 +1221,15 @@ def parse_name_from_text(text, config, verbosity=0):
                     efternamn = processed_words[-1]
                     fornamn = ' '.join(processed_words[:-1])
 
+                # NEW: Check if only one name part exists after splitting
+                if (efternamn and not fornamn) or (fornamn and not efternamn):
+                    if verbosity > 1:
+                        if efternamn and not fornamn:
+                            print(f"    DISCARDING: Only efternamn '{efternamn}' found after splitting - discarding entire name", file=sys.stderr)
+                        else:
+                            print(f"    DISCARDING: Only fornamn '{fornamn}' found after splitting - discarding entire name", file=sys.stderr)
+                    return "", ""
+
                 if verbosity > 1:
                     if processed_words != words:
                         print(f"    Name processing (space-separated): '{text}' → cleaned: '{cleaned_text}' → processed: '{' '.join(processed_words)}' → '{efternamn}, {fornamn}'", 
@@ -1223,18 +1242,14 @@ def parse_name_from_text(text, config, verbosity=0):
             elif len(processed_words) == 1:
                 # After processing, only one word left - can't split into efternamn/fornamn
                 if verbosity > 1:
-                    print(f"    Name processing (space-separated): '{text}' → only one word after processing: '{processed_words[0]}'", 
+                    print(f"    Name processing (space-separated): '{text}' → only one word after processing: '{processed_words[0]}' - discarding", 
                           file=sys.stderr)
-                return None, None
+                return "", ""
         elif len(words) == 1:
-            # Only one word - check if it's a known name
-            word = words[0]
-            if config.use_scb_names:
-                if word in config.first_names_set:
-                    return "", word
-                elif word in config.last_names_set:
-                    return word, ""
-            return None, None
+            # Only one word - discard the name
+            if verbosity > 1:
+                print(f"    Name processing: Only one word '{words[0]}' found - discarding entire name", file=sys.stderr)
+            return "", ""
         return None, None
 
 def _process_inheritance_with_hole_filling(
