@@ -2571,6 +2571,15 @@ def preprocess_name_variants_with_unidecode(name_variants, config, verbosity):
         else:
             # Multiple variants with same unidecode word multiset
 
+            # Check if all variants are identical
+            first_variant = group[0]
+            if all(variant == first_variant for variant in group):
+                # All variants are identical, just keep one
+                if verbosity > 1:
+                    print(f"    All {len(group)} variants are identical, keeping one", file=sys.stderr)
+                processed_variants.append(first_variant)
+                continue
+
             # First, check if there's a comma-separated variant in this group
             has_comma = any(is_comma for _, _, is_comma in group)
             has_space = any(not is_comma for _, _, is_comma in group)
