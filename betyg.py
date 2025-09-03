@@ -2596,13 +2596,21 @@ def preprocess_name_variants_with_unidecode(name_variants, config, verbosity):
                 for word in all_words:
                     if word in scb_names:
                         unidecode_word = unidecode.unidecode(word)
-                        # If we haven't seen this unidecode version yet, or if this is in SCB
-                        if unidecode_word not in unidecode_to_scb or word in scb_names:
+                        # Store this SCB word for its unidecode representation
+                        if unidecode_word not in unidecode_to_scb:
                             unidecode_to_scb[unidecode_word] = word
 
             if verbosity > 1 and unidecode_to_scb:
                 print(f"    Unidecode preprocessing: Found {len(group)} variants with same unidecode word multiset", file=sys.stderr)
-                print(f"      Word replacements: {', '.join(f'{k}→{v}' for k, v in unidecode_to_scb.items() if k != v)}", file=sys.stderr)
+                replacements = []
+                for efternamn, fornamn, is_comma in group:
+                    for word in efternamn.split() + fornamn.split():
+                        if word not in scb_names:  # Only show replacements for non-SCB words
+                            unidecode_word = unidecode.unidecode(word)
+                            if unidecode_word in unidecode_to_scb and unidecode_to_scb[unidecode_word] != word:
+                                replacements.append(f'{word}→{unidecode_to_scb[unidecode_word]}')
+                if replacements:
+                    print(f"      Word replacements: {', '.join(set(replacements))}", file=sys.stderr)
 
             # Process each variant, replacing words IN PLACE (preserving order and duplicates)
             # BUT filter out space-separated if comma-separated exists
@@ -2616,20 +2624,30 @@ def preprocess_name_variants_with_unidecode(name_variants, config, verbosity):
                 # Process efternamn - preserve order and duplicates
                 new_efternamn_words = []
                 for word in efternamn.split():
-                    unidecode_word = unidecode.unidecode(word)
-                    if unidecode_word in unidecode_to_scb:
-                        new_efternamn_words.append(unidecode_to_scb[unidecode_word])
-                    else:
+                    # If word is already in SCB, keep it as is
+                    if word in scb_names:
                         new_efternamn_words.append(word)
+                    else:
+                        # Word is not in SCB, check if we can replace it
+                        unidecode_word = unidecode.unidecode(word)
+                        if unidecode_word in unidecode_to_scb:
+                            new_efternamn_words.append(unidecode_to_scb[unidecode_word])
+                        else:
+                            new_efternamn_words.append(word)
 
                 # Process fornamn - preserve order and duplicates
                 new_fornamn_words = []
                 for word in fornamn.split():
-                    unidecode_word = unidecode.unidecode(word)
-                    if unidecode_word in unidecode_to_scb:
-                        new_fornamn_words.append(unidecode_to_scb[unidecode_word])
-                    else:
+                    # If word is already in SCB, keep it as is
+                    if word in scb_names:
                         new_fornamn_words.append(word)
+                    else:
+                        # Word is not in SCB, check if we can replace it
+                        unidecode_word = unidecode.unidecode(word)
+                        if unidecode_word in unidecode_to_scb:
+                            new_fornamn_words.append(unidecode_to_scb[unidecode_word])
+                        else:
+                            new_fornamn_words.append(word)
 
                 new_efternamn = ' '.join(new_efternamn_words)
                 new_fornamn = ' '.join(new_fornamn_words)
