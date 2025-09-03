@@ -1369,6 +1369,7 @@ def parse_name_from_text(text, config, verbosity=0):
             return "", "", False
         return None, None, False
 
+
 def _process_inheritance_with_hole_filling(
     current_page_entries: Dict[int, List[Dict]], 
     total_pages: int, 
@@ -1380,6 +1381,8 @@ def _process_inheritance_with_hole_filling(
 
     New feature: If pages without personnummer are surrounded by pages with identical 
     personnummer, fill the hole with that personnummer.
+
+    Also tracks comma separator status for names.
     """
     final_data = []
     pnr_to_names = defaultdict(list)
@@ -1414,9 +1417,9 @@ def _process_inheritance_with_hole_filling(
             # Page has personnummer - use it
             pnr = entry['personnummer']
 
-            # Track name combinations
-            name_combo = (entry['efternamn'], entry['fornamn'])
-            if name_combo != ("", ""):
+            # Track name combinations WITH COMMA SEPARATOR INFO
+            name_combo = (entry['efternamn'], entry['fornamn'], entry.get('is_comma_separated', False))
+            if name_combo[:2] != ("", ""):  # Check first two elements (names)
                 pnr_to_names[pnr].append(name_combo)
 
             # Add to final data
@@ -1528,6 +1531,7 @@ def _process_inheritance_with_hole_filling(
                     })
 
     return final_data, pnr_to_names, pages_with_pnr, pages_without_pnr
+
 
 def should_filter_line(line, config):
     """Check if a line should be filtered out when searching for names."""
@@ -2195,7 +2199,7 @@ def _resolve_name_variants(
     config: Config, 
     verbosity: int
 ) -> Dict[str, Tuple[str, str]]:
-    """Resolve name variants for each personnummer.
+    """Resolve name variants for each personnummer with preprocessing and comma preference.
 
     Returns:
         Dictionary mapping personnummer to final (efternamn, fornamn)
@@ -2204,43 +2208,28 @@ def _resolve_name_variants(
         print("\nResolving name variants for each personnummer...", file=sys.stderr)
 
     pnr_final_names = {}
-    scandinavian_preferences = 0
-    tied_selections = []
+    comma_preferences = 0
 
     for pnr, name_list in pnr_to_names.items():
         if name_list:
-            name_counter = Counter(name_list)
+            # Preprocess the name variants to handle unidecode matching
+            preprocessed_list = preprocess_name_variants_with_unidecode(name_list, config, verbosity)
 
-            # Use the selection algorithm with enhanced scoring
-            selected_name = select_best_name_variant(name_counter, pnr, config, verbosity)
+            # Count occurrences including comma separator info
+            name_counter = Counter(preprocessed_list)
 
-            # Check if enhanced scoring was applied
-            most_common_by_count = name_counter.most_common(1)[0][0]
-            if selected_name != most_common_by_count:
-                if has_scandinavian_chars(selected_name[0] + selected_name[1]):
-                    scandinavian_preferences += 1
+            # Use the selection algorithm with comma preference
+            selected_name = select_best_name_variant_with_comma_preference(name_counter, pnr, config, verbosity)
 
-            # Check for ties in original counting
-            if len(name_counter) > 1:
-                top_count = name_counter.most_common(1)[0][1]
-                ties = [(name, count) for name, count in name_counter.items() if count == top_count]
-                if len(ties) > 1:
-                    tied_selections.append((pnr, selected_name, len(ties)))
-            elif verbosity > 1:
-                # Only one variant found
-                print(f"  {pnr}: {selected_name[0]}, {selected_name[1]} (unanimous)", file=sys.stderr)
+            # Check if comma preference was applied
+            comma_variants = [name for name in preprocessed_list if name[2]]  # is_comma is True
+            if comma_variants and selected_name in [(n[0], n[1]) for n in comma_variants]:
+                comma_preferences += 1
 
             pnr_final_names[pnr] = selected_name
 
-    if scandinavian_preferences > 0 and verbosity >= 0:
-        print(f"\nApplied enhanced scoring (Scandinavian/penalty) preference to {scandinavian_preferences} names", file=sys.stderr)
-
-    if tied_selections and verbosity >= 0:
-        print(f"\nResolved {len(tied_selections)} ties in name variants:", file=sys.stderr)
-        if verbosity > 0:
-            for pnr, selected_name, num_ties in tied_selections[:10]:
-                print(f"  {pnr}: Selected '{selected_name[0]}, {selected_name[1]}' from {num_ties} equally common variants", 
-                      file=sys.stderr)
+    if comma_preferences > 0 and verbosity >= 0:
+        print(f"\nApplied comma-separated format preference to {comma_preferences} names", file=sys.stderr)
 
     return pnr_final_names
 
@@ -2461,7 +2450,7 @@ def extract_personnummer_and_names(text, page_num, config, verbosity, include_in
                       file=sys.stderr)
         final_personnummer = ""  # Clear invalid personnummer unless include_invalid is set
 
-    # Step 6: Return complete result
+    # Step 6: Return complete result WITH COMMA SEPARATOR INFO
     return [{
         'personnummer': final_personnummer if (include_invalid or selected['luhn_valid'] or 'TF' in selected['personnummer']) else "",
         'efternamn': efternamn,
@@ -2472,8 +2461,178 @@ def extract_personnummer_and_names(text, page_num, config, verbosity, include_in
         'luhn_check_valid': selected['luhn_check_valid'],
         'is_samordningsnummer': selected.get('is_samordningsnummer', False),
         'was_early_rejection': selected.get('rejection_reason') and 'organizational number' in selected.get('rejection_reason', ''),
-        'was_late_rejection': is_late_rejection
+        'was_late_rejection': is_late_rejection,
+        'is_comma_separated': False  # This needs to be tracked from extraction
     }]
+
+
+def select_best_name_variant_with_comma_preference(name_counter, pnr, config, verbosity):
+    """Select the best name variant with strong preference for comma-separated variants."""
+    if len(name_counter) == 1:
+        return list(name_counter.keys())[0][:2]  # Return only (efternamn, fornamn)
+
+    # Score all variants
+    scored_variants = []
+
+    for (efternamn, fornamn, is_comma), count in name_counter.items():
+        full_name = efternamn + fornamn
+
+        # Base score from occurrence count
+        score = count
+
+        # HIGHEST PRIORITY: Comma-separated format
+        if is_comma:
+            score += 10000  # Very high bonus for comma-separated
+            if verbosity > 1:
+                print(f"    Comma-separated bonus: +10000 for '{efternamn}, {fornamn}'", file=sys.stderr)
+
+        # SCB name list matching bonuses
+        if config.use_scb_names:
+            if fornamn in config.first_names_set:
+                score += config.first_name_match_bonus  # 2000
+                if verbosity > 1:
+                    print(f"    SCB name bonus: '{fornamn}' found in first names (+{config.first_name_match_bonus})", 
+                          file=sys.stderr)
+
+            if efternamn in config.last_names_set:
+                score += config.last_name_match_bonus  # 2000
+                if verbosity > 1:
+                    print(f"    SCB name bonus: '{efternamn}' found in last names (+{config.last_name_match_bonus})", 
+                          file=sys.stderr)
+
+        # Scandinavian character bonus (lower priority than SCB lists)
+        scand_count = count_scandinavian_chars(full_name)
+        score += scand_count * config.scandinavian_bonus  # 1000 per character
+
+        # ALL CAPS penalty
+        if is_all_caps(efternamn) or is_all_caps(fornamn):
+            score -= config.all_caps_penalty
+
+        # Excessive length penalty
+        if len(efternamn) > config.excessive_length_threshold:
+            score -= config.excessive_length_penalty
+        if len(fornamn) > config.excessive_length_threshold:
+            score -= config.excessive_length_penalty
+
+        scored_variants.append(((efternamn, fornamn, is_comma), count, score))
+
+    # Sort by score (highest first)
+    scored_variants.sort(key=lambda x: x[2], reverse=True)
+    selected = scored_variants[0][0]
+
+    if verbosity > 0 and len(scored_variants) > 1:
+        print(f"  {pnr}: Selected from {len(scored_variants)} variants:", file=sys.stderr)
+        for (efternamn, fornamn, is_comma), count, score in scored_variants[:3]:  # Show top 3
+            format_type = " (comma)" if is_comma else " (space)"
+            marker = " ← SELECTED" if (efternamn, fornamn, is_comma) == selected else ""
+            print(f"    {efternamn}, {fornamn}{format_type} (occurs {count}x, score={score}){marker}", 
+                  file=sys.stderr)
+
+    return selected[:2]  # Return only (efternamn, fornamn)
+
+
+def preprocess_name_variants_with_unidecode(name_variants, config, verbosity):
+    """Preprocess name variants to handle unidecode matching and SCB list replacement.
+
+    If the SET of words for name candidate strings have the same unidecode representation:
+    1. Choose the words that appear in EITHER SCB list (order preserved)
+    2. Within the same unidecode group, prefer comma-separated variants
+    """
+    if not config.use_scb_names:
+        return name_variants
+
+    # Get all SCB names
+    scb_names = config.first_names_set | config.last_names_set
+
+    if not scb_names:
+        return name_variants
+
+    # Group variants by their unidecode word multiset (preserving duplicates, ignoring order)
+    unidecode_groups = defaultdict(list)
+
+    for (efternamn, fornamn, is_comma) in name_variants:
+        # Get all words from the name
+        all_words = efternamn.split() + fornamn.split()
+
+        # Create unidecode representation as sorted tuple (preserves duplicates, ignores order)
+        unidecode_words = [unidecode.unidecode(word) for word in all_words]
+        unidecode_word_key = tuple(sorted(unidecode_words))
+
+        # Store the variant with its original structure
+        unidecode_groups[unidecode_word_key].append((efternamn, fornamn, is_comma))
+
+    # Process each group
+    processed_variants = []
+
+    for unidecode_word_key, group in unidecode_groups.items():
+        if len(group) == 1:
+            # Only one variant, keep as is
+            processed_variants.append(group[0])
+        else:
+            # Multiple variants with same unidecode word multiset
+
+            # First, check if there's a comma-separated variant in this group
+            has_comma = any(is_comma for _, _, is_comma in group)
+            has_space = any(not is_comma for _, _, is_comma in group)
+
+            if has_comma and has_space and verbosity > 1:
+                print(f"    Found both comma and space variants in same unidecode group - preferring comma", file=sys.stderr)
+
+            # Build mapping from unidecode version to SCB version
+            unidecode_to_scb = {}
+
+            # Check all words across all variants in this group
+            for efternamn, fornamn, is_comma in group:
+                all_words = efternamn.split() + fornamn.split()
+                for word in all_words:
+                    if word in scb_names:
+                        unidecode_word = unidecode.unidecode(word)
+                        # If we haven't seen this unidecode version yet, or if this is in SCB
+                        if unidecode_word not in unidecode_to_scb or word in scb_names:
+                            unidecode_to_scb[unidecode_word] = word
+
+            if verbosity > 1 and unidecode_to_scb:
+                print(f"    Unidecode preprocessing: Found {len(group)} variants with same unidecode word multiset", file=sys.stderr)
+                print(f"      Word replacements: {', '.join(f'{k}→{v}' for k, v in unidecode_to_scb.items() if k != v)}", file=sys.stderr)
+
+            # Process each variant, replacing words IN PLACE (preserving order and duplicates)
+            # BUT filter out space-separated if comma-separated exists
+            for efternamn, fornamn, is_comma in group:
+                # Skip space-separated if comma-separated exists in this group
+                if has_comma and not is_comma:
+                    if verbosity > 1:
+                        print(f"      Skipping space-separated: '{efternamn} {fornamn}' (comma variant exists)", file=sys.stderr)
+                    continue
+
+                # Process efternamn - preserve order and duplicates
+                new_efternamn_words = []
+                for word in efternamn.split():
+                    unidecode_word = unidecode.unidecode(word)
+                    if unidecode_word in unidecode_to_scb:
+                        new_efternamn_words.append(unidecode_to_scb[unidecode_word])
+                    else:
+                        new_efternamn_words.append(word)
+
+                # Process fornamn - preserve order and duplicates
+                new_fornamn_words = []
+                for word in fornamn.split():
+                    unidecode_word = unidecode.unidecode(word)
+                    if unidecode_word in unidecode_to_scb:
+                        new_fornamn_words.append(unidecode_to_scb[unidecode_word])
+                    else:
+                        new_fornamn_words.append(word)
+
+                new_efternamn = ' '.join(new_efternamn_words)
+                new_fornamn = ' '.join(new_fornamn_words)
+
+                if verbosity > 1 and (new_efternamn != efternamn or new_fornamn != fornamn):
+                    format_type = "comma" if is_comma else "space"
+                    print(f"      Preprocessed ({format_type}): '{efternamn}, {fornamn}' → '{new_efternamn}, {new_fornamn}'", 
+                          file=sys.stderr)
+
+                processed_variants.append((new_efternamn, new_fornamn, is_comma))
+
+    return processed_variants
 
 def ocr_single_page(args):
     """OCR a single page with improved error handling, SCB names dictionary, and personnummer patterns."""
